@@ -1,0 +1,93 @@
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ============================================================================
+# Trading data — never commit user portfolio CSVs
+# ============================================================================
+# TradingView strategy exports (List of Trades CSV) — contain personal P&L.
+# Users supply their own via the sidebar "Portfolio folder" config.
+*.csv
+
+# Sample folders that may exist in dev — keep app code, not data
+data/
+Portfolio/
+Incubation/
+sample_data/
+test_data/
+
+# Cached price data
+.cache/
+btc_cache/
+ticker_cache/
+
+# ============================================================================
+# Streamlit
+# ============================================================================
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
+# ============================================================================
+# OS files
+# ============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ============================================================================
+# IDE / editors
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# ============================================================================
+# Logs and test artifacts
+# ============================================================================
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
