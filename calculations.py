@@ -31,13 +31,18 @@ Public function groups:
 """
 
 import glob
+import logging
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# Module logger — replaces bare `print()` for error/warning paths so messages
+# show up in Streamlit's terminal but are filterable by level if redirected.
+logger = logging.getLogger(__name__)
 import requests
 from scipy import stats
 
@@ -105,7 +110,7 @@ def _fetch_ticker_regime(ticker: str, start: str, end: str,
             bear_threshold=bear_threshold,
         )
     except Exception as e:
-        print(f"Failed to fetch {ticker} regime: {e}")
+        logger.warning("Failed to fetch %s regime: %s", ticker, e)
         return pd.Series(dtype=object)
 
 
@@ -220,10 +225,10 @@ def get_risk_ratios(daily_returns: pd.Series, risk_free_annual: float) -> Tuple[
         return 0.0, 0.0
     rf_daily = risk_free_annual / 365.0
     excess = daily_returns - rf_daily
-    sharpe = float((excess.mean() / daily_returns.std()) * np.sqrt(365))
+    sharpe = float((excess.mean() / daily_returns.std()) * ANNUALIZATION_FACTOR)
     downside = np.minimum(0, excess)
     downside_dev = np.sqrt(np.mean(downside ** 2))
-    sortino = float((excess.mean() / downside_dev) * np.sqrt(365)) if downside_dev > 0 else 0.0
+    sortino = float((excess.mean() / downside_dev) * ANNUALIZATION_FACTOR) if downside_dev > 0 else 0.0
     return sharpe, sortino
 
 
@@ -328,7 +333,7 @@ def rolling_sharpe(daily_returns: pd.Series, window: int = 30,
     """Rolling annualized Sharpe."""
     rf_daily = risk_free_annual / 365.0
     excess = daily_returns - rf_daily
-    return (excess.rolling(window).mean() / daily_returns.rolling(window).std()) * np.sqrt(365)
+    return (excess.rolling(window).mean() / daily_returns.rolling(window).std()) * ANNUALIZATION_FACTOR
 
 
 def rolling_calmar(daily_pnl: pd.Series, starting_capital: float,
@@ -555,6 +560,12 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
                 raise KeyError(f"missing 'Date/Time' (or 'Date and time') column. Got: {list(df.columns)[:6]}")
             df['Date/Time'] = pd.to_datetime(df['Date/Time'], errors='coerce')
             df.dropna(subset=['Date/Time'], inplace=True)
+            # Normalize to tz-naive — comparing tz-aware Timestamps to naive
+            # `oos_start` strings raises TypeError, which would silently drop
+            # the strategy from the portfolio (the outer try/except logs it
+            # as "failed" and the user sees one fewer strategy than expected).
+            if isinstance(df['Date/Time'].dtype, pd.DatetimeTZDtype):
+                df['Date/Time'] = df['Date/Time'].dt.tz_localize(None)
             df.sort_values('Date/Time', inplace=True)
             df = df[(df['Date/Time'] >= oos_start) & (df['Date/Time'] <= f"{oos_end} 23:59:59")].copy()
             if df.empty:
@@ -631,7 +642,7 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
             all_daily_pnl = pd.concat([all_daily_pnl, daily_pnl], axis=1, sort=False)
         except Exception as e:
             failed_files.append((name, str(e)))
-            print(f"Error reading {name}: {e}")
+            logger.warning("Error reading %s: %s", name, e)
 
     all_daily_pnl.fillna(0, inplace=True)
     all_daily_pnl.sort_index(inplace=True)
@@ -707,7 +718,7 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
                 start_price = float(btc_aligned.iloc[0])
                 plot_data['B&H BTC Equity'] = (btc_aligned / start_price) * total_cap
     except Exception as e:
-        print(f"Binance BTC auto-fetch failed: {e}")
+        logger.warning("Binance BTC auto-fetch failed: %s", e)
 
     return metrics_df, portfolio_stats, plot_data, all_daily_exposure
 
@@ -832,7 +843,7 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
             continue
         port_pnl_pre = port_pnl_pre + plot_data[col].fillna(0) * (position_pre[col] / bt_pos)
     port_returns_pre = port_pnl_pre / total_cap
-    portfolio_vol_pre = float(port_returns_pre.std() * np.sqrt(365))
+    portfolio_vol_pre = float(port_returns_pre.std() * ANNUALIZATION_FACTOR)
 
     # Step 4: portfolio scale
     if target_portfolio_vol > 0 and portfolio_vol_pre > 1e-9:
@@ -867,7 +878,7 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
             port_pnl = port_pnl - (daily_trade_cost + daily_funding_cost)
 
     portfolio_returns = port_pnl / total_cap
-    portfolio_vol = float(portfolio_returns.std() * np.sqrt(365))
+    portfolio_vol = float(portfolio_returns.std() * ANNUALIZATION_FACTOR)
 
     # Sum-of-weighted-strategy-vols (= portfolio vol if ρ=1)
     sum_strat_vol_contrib = sum(
@@ -1092,15 +1103,15 @@ def deflated_sharpe(observed_sharpe: float, n_trials: int, n_obs: int,
     Returns dict with psr, expected_max_sharpe, is_significant, sharpe_std."""
     if n_obs < 10 or n_trials < 1:
         return {'psr': 0.0, 'expected_max_sharpe': 0.0, 'is_significant': False, 'sharpe_std': 0.0}
-    sr_daily = observed_sharpe / np.sqrt(365)
+    sr_daily = observed_sharpe / ANNUALIZATION_FACTOR
     e_max_daily = (
         (1 - np.euler_gamma) * stats.norm.ppf(1 - 1.0 / n_trials)
         + np.euler_gamma * stats.norm.ppf(1 - 1.0 / (n_trials * np.e))
     ) / np.sqrt(n_obs)
-    e_max_annual = e_max_daily * np.sqrt(365)
+    e_max_annual = e_max_daily * ANNUALIZATION_FACTOR
     sr_std = np.sqrt(
         max((1 - skewness * sr_daily + ((kurtosis - 1) / 4.0) * sr_daily ** 2) / (n_obs - 1), 1e-12)
-    ) * np.sqrt(365)
+    ) * ANNUALIZATION_FACTOR
     psr = float(stats.norm.cdf((observed_sharpe - e_max_annual) / sr_std))
     return {
         'psr': psr,
@@ -1224,6 +1235,13 @@ MIN_LIVE_TRADES_FOR_KS = 5    # need ≥5 live trades to compare distributions
 
 # Rolling-window length for Sharpe / Calmar charts (days)
 ROLLING_WINDOW_DAYS = 60
+
+# Annualization for crypto Sharpe / Sortino / vol — 365 day year (NOT 252).
+# Crypto trades 24/7, so all 365 days are trading days. Promoting this from
+# 10 inline `np.sqrt(365)` literals to a single constant makes the daily-vs-
+# annual unit assumption explicit and easy to change.
+TRADING_DAYS_PER_YEAR = 365
+ANNUALIZATION_FACTOR = float(np.sqrt(TRADING_DAYS_PER_YEAR))  # ≈ 19.105
 
 # Default MC bootstrap params for per-strategy evaluation
 MC_DEFAULT_RUNS = 1000
@@ -1379,7 +1397,10 @@ def distribution_drift_test(bt_returns: pd.Series, live_returns: pd.Series,
     lv = pd.Series(live_returns).fillna(0)
     bt = bt[bt != 0]
     lv = lv[lv != 0]
-    if len(bt) < 10 or len(lv) < 5:
+    # Unified with _ks_edge_diagnosis — both functions now use the same
+    # sample-size floor so a single strategy doesn't get two different KS
+    # verdicts in two different UI surfaces.
+    if len(bt) < MIN_BT_TRADES_FOR_KS or len(lv) < MIN_LIVE_TRADES_FOR_KS:
         return {
             'ks_stat': None, 'ks_pvalue': None, 'mw_pvalue': None,
             'verdict': 'insufficient_data',
@@ -1474,7 +1495,7 @@ def per_strategy_regime_metrics(daily_pnl: pd.Series, regime: pd.Series,
         if len(nonzero) < 5 or sub.std() == 0:
             out[r] = None
             continue
-        sh = (sub.mean() / sub.std()) * np.sqrt(365)
+        sh = (sub.mean() / sub.std()) * ANNUALIZATION_FACTOR
         pf = profit_factor(nonzero.values)
         if not np.isfinite(pf):
             pf = 999.0
@@ -2422,13 +2443,20 @@ def _eval_segments(daily_pnl: pd.Series, starting_capital: float, rfr: float,
 
 
 def _eval_mc_envelope(bt_pnl: pd.Series, live_final_pnl: float, live_dd_dollars: float,
-                       n_live_days: int, n_mc_runs: int) -> dict:
+                       n_live_days: int, n_mc_runs: int,
+                       block_len: int = MC_DEFAULT_BLOCK_LEN,
+                       seed: Optional[int] = MC_DEFAULT_SEED) -> dict:
     """Bootstrap MC envelope from BT and compute live percentiles.
+
+    seed and block_len must be plumbed from the caller — without them, the
+    envelope is permanently locked to defaults (42, 5) regardless of sidebar
+    settings. That would cause silently non-reproducible kill verdicts.
 
     Returns dict with: mc (full bootstrap dist + percentile bands),
     mc_return_percentile, mc_dd_percentile.
     """
-    mc = strategy_monte_carlo(bt_pnl, max(n_live_days, 1), n_runs=n_mc_runs)
+    mc = strategy_monte_carlo(bt_pnl, max(n_live_days, 1),
+                              n_runs=n_mc_runs, block_len=block_len, seed=seed)
     return {
         'mc': mc,
         'mc_return_percentile': _mc_percentile(live_final_pnl, mc['final_pnls']),
@@ -2473,7 +2501,12 @@ def _kill_verdict(mc_dd_pct: Optional[float], mc_ret_pct: Optional[float],
     if mc_dd_pct is None or mc_ret_pct is None:
         return '⏳ Insufficient data', VERDICT_COLORS['incubating']
     if live_trades < MIN_LIVE_TRADES:
-        return (f'⏳ Incubating ({live_trades}/{MIN_LIVE_TRADES} trades)',
+        # NOTE: live_trades is actually the active-trade-day count (days with
+        # at least one exit), not literal trade count. For intraday strategies
+        # multiple trades/day collapse to 1. Label says "active days" to be
+        # honest about what's measured; previously said "trades" which contra-
+        # dicted the trade-log gate (counts raw exit rows).
+        return (f'⏳ Incubating ({live_trades}/{MIN_LIVE_TRADES} active days)',
                 VERDICT_COLORS['incubating'])
     if mc_dd_pct < MC_TAIL_PCT and mc_ret_pct < MC_TAIL_PCT:
         return f'🔴 KILL (DD & Return < P{MC_TAIL_PCT})', VERDICT_COLORS['kill']
@@ -2511,12 +2544,26 @@ def _ks_edge_diagnosis(bt_pnl: pd.Series, live_pnl: pd.Series,
                 (mc_ret_pct is not None and mc_ret_pct < MC_TAIL_PCT))
     ks_fires = (ks_p is not None and ks_p < KS_ALPHA)
 
-    if ks_p is None or mc_dd_pct is None or mc_ret_pct is None:
+    # If MC %iles themselves are missing (no live data), diagnosis is n/a.
+    if mc_dd_pct is None or mc_ret_pct is None:
         return ks_p, mw_p, '⏳ n/a', VERDICT_COLORS['incubating']
+    # If KS is unavailable (sparse strategy with < MIN_BT_TRADES_FOR_KS active
+    # days), don't suppress the diagnosis entirely — fall back to MC-only signal
+    # with an annotation so the user knows KS couldn't run. Previously the
+    # entire 4-way matrix collapsed to "n/a" for low-frequency strategies
+    # (HLD_DAY, MR_VOTING etc.) which made archive-vs-suspend decisions blind.
+    if ks_p is None:
+        if mc_fires:
+            return None, None, '🔴 KILL (KS unavailable, n<20)', VERDICT_COLORS['kill']
+        return None, None, '🟢 STABLE (KS unavailable, n<20)', VERDICT_COLORS['keep']
     if mc_fires and ks_fires:
         return ks_p, mw_p, '🔴 BROKEN EDGE', VERDICT_COLORS['kill']
     if mc_fires and not ks_fires:
-        return ks_p, mw_p, '🟠 UNLUCKY (edge intact)', VERDICT_COLORS['edge_drift']
+        # NOTE: use 'warn' (amber) rather than 'edge_drift' (orange) since
+        # UNLUCKY means "kill fires but per-trade distribution is stable" —
+        # the edge ISN'T drifting; it's the path that's been unlucky. Using
+        # the drift color was a semantic mismatch flagged in audit.
+        return ks_p, mw_p, '🟠 UNLUCKY (edge intact)', VERDICT_COLORS['warn']
     if not mc_fires and ks_fires:
         return ks_p, mw_p, '🟡 EDGE DRIFTING', VERDICT_COLORS['watch']
     return ks_p, mw_p, '🟢 STABLE', VERDICT_COLORS['keep']
@@ -2533,7 +2580,9 @@ def _rolling_metrics(pnl: pd.Series, starting_capital: float, rfr: float
 
 def per_strategy_evaluation(daily_pnl: pd.Series, starting_capital: float,
                               rfr: float, split_date: pd.Timestamp,
-                              n_mc_runs: int = MC_DEFAULT_RUNS) -> 'StrategyEvaluation':
+                              n_mc_runs: int = MC_DEFAULT_RUNS,
+                              mc_block_len: int = MC_DEFAULT_BLOCK_LEN,
+                              mc_seed: Optional[int] = MC_DEFAULT_SEED) -> 'StrategyEvaluation':
     """Master per-strategy evaluation for the Live Monitoring tab.
 
     Computes EVERY signal needed to render one strategy's drill-down panel,
@@ -2585,6 +2634,7 @@ def per_strategy_evaluation(daily_pnl: pd.Series, starting_capital: float,
     env = _eval_mc_envelope(
         seg['bt_pnl'], seg['live_final_pnl'], seg['live_dd_dollars'],
         n_live_days=len(seg['live_pnl']), n_mc_runs=n_mc_runs,
+        block_len=mc_block_len, seed=mc_seed,
     )
 
     # ── 3. Per-stat verdicts (informational, displayed in drill-down banner)
@@ -2791,7 +2841,10 @@ def live_monitoring_analysis(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
                               vt_kwargs: Optional[dict] = None,
                               regime_lookback: int = 60,
                               regime_bull_thr: float = 0.10,
-                              regime_bear_thr: float = -0.10) -> dict:
+                              regime_bear_thr: float = -0.10,
+                              mc_n_runs: int = MC_DEFAULT_RUNS,
+                              mc_block_len: int = MC_DEFAULT_BLOCK_LEN,
+                              mc_seed: Optional[int] = MC_DEFAULT_SEED) -> dict:
     """Master live-monitoring orchestrator — produces every signal the live tab renders.
 
     Honest OOS workflow: vol-targeting is derived from BACKTEST-ONLY data, then
@@ -2981,17 +3034,20 @@ def live_monitoring_analysis(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
     per_strategy_evals: dict = {}
     for col in strategy_cols_for_tickers:
         per_strategy_evals[col] = per_strategy_evaluation(
-            plot_data[col], per_strat_cap, rfr, split, n_mc_runs=1000,
+            plot_data[col], per_strat_cap, rfr, split,
+            n_mc_runs=mc_n_runs, mc_block_len=mc_block_len, mc_seed=mc_seed,
         )
 
     # --- Step 9: Bootstrap equity envelope (portfolio level) ---
     # Build the ±2σ envelope for the live segment using BT daily P&L. This is
     # the "should live be here?" hypothesis test: under H0 of no decay, the
     # live equity curve should stay within the P5-P95 band ~90% of the time.
+    # Uses the same MC seed/block as per-strategy envelopes so all live tab
+    # statistics are reproducible from a single sidebar control.
     n_live = len(live_port_pnl)
     envelope_df = bootstrap_equity_envelope(
         bt_port_pnl, n_live_days=n_live, starting_equity=float(total_cap),
-        n_sims=1000, seed=42, block_len=5,
+        n_sims=mc_n_runs, seed=mc_seed, block_len=mc_block_len,
     )
     live_equity_actual = live_port_pnl.cumsum() + total_cap
     envelope_status = live_within_envelope(live_equity_actual.values, envelope_df)
@@ -3200,7 +3256,7 @@ def information_ratio(returns: pd.Series, bench_returns: pd.Series) -> float:
     active = aligned['r'] - aligned['b']
     if active.std() == 0:
         return 0.0
-    return float((active.mean() / active.std()) * np.sqrt(365))
+    return float((active.mean() / active.std()) * ANNUALIZATION_FACTOR)
 
 
 def treynor_ratio(returns: pd.Series, bench_returns: pd.Series,

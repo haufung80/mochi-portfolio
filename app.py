@@ -3,7 +3,6 @@ Mochi Portfolio Analysis Dashboard (Streamlit)
 Comprehensive backtest analytics + walk-forward + costs + regimes + sizing.
 """
 
-import io
 import math
 import re
 import streamlit as st
@@ -457,6 +456,10 @@ def render_live_drilldown(
         raw_df = pd.read_csv(csv_path)
         raw_df = calculations._normalize_tv_columns(raw_df)
         raw_df['Date/Time'] = pd.to_datetime(raw_df['Date/Time'], errors='coerce')
+        # Strip tz so comparison with naive split_date doesn't raise (same
+        # fix as process_portfolio — tz-aware CSVs would silently fail here).
+        if isinstance(raw_df['Date/Time'].dtype, pd.DatetimeTZDtype):
+            raw_df['Date/Time'] = raw_df['Date/Time'].dt.tz_localize(None)
         raw_df = raw_df.dropna(subset=['Date/Time'])
         live_exits = raw_df[
             (raw_df['Date/Time'] >= split_date) &
@@ -479,18 +482,49 @@ def render_live_drilldown(
             f"Sum P&L **${live_exits['Net P&L USDT'].sum():+,.2f}** · {gate_status}"
         )
 
-        display_cols = ['Trade #', 'Date/Time', 'Type', 'Signal',
-                        'Net P&L USDT', 'Cumulative P&L']
-        display_cols = [c for c in display_cols if c in live_exits.columns]
-        show_df = live_exits[display_cols].copy()
+        # Build display frame with explicit Win/Loss column + rename P&L headers
+        # for unambiguous gain/loss reading. The 🟢/🔴 prefix shows at a glance
+        # which trades won and which lost — no need to read sign of P&L number.
+        base_cols = ['Trade #', 'Date/Time', 'Type', 'Signal',
+                     'Net P&L USDT', 'Cumulative P&L']
+        base_cols = [c for c in base_cols if c in live_exits.columns]
+        show_df = live_exits[base_cols].copy()
         show_df['Date/Time'] = show_df['Date/Time'].dt.strftime('%Y-%m-%d %H:%M')
+
+        # Insert W/L emoji column right after Trade # for visual scan
+        def _win_loss_icon(pnl: float) -> str:
+            if pnl > 0:
+                return '🟢 WIN'
+            if pnl < 0:
+                return '🔴 LOSS'
+            return '⚪ FLAT'
+        show_df.insert(1, 'Result', show_df['Net P&L USDT'].apply(_win_loss_icon))
+
+        # Rename P&L columns to make the gain/loss meaning explicit
+        show_df = show_df.rename(columns={
+            'Net P&L USDT':   'Trade Gain/Loss $',
+            'Cumulative P&L': 'Cumulative Gain/Loss $',
+        })
+
+        # Streamlit NumberColumn for formatting (printf style — no `,` separator).
+        # Sign shown via `+` in format string AND reinforced by the Result column.
         st.dataframe(
             show_df, hide_index=True, use_container_width=True,
             height=min(420, 36 * len(show_df) + 38),
             column_config={
                 'Trade #': st.column_config.NumberColumn(format="%d", width='small'),
-                'Net P&L USDT': st.column_config.NumberColumn(format="$%+,.2f"),
-                'Cumulative P&L': st.column_config.NumberColumn(format="$%+,.2f"),
+                'Result': st.column_config.TextColumn(
+                    width='small',
+                    help="🟢 WIN = positive P&L · 🔴 LOSS = negative P&L · ⚪ FLAT = breakeven",
+                ),
+                'Trade Gain/Loss $': st.column_config.NumberColumn(
+                    format="$%+.2f",
+                    help="Realized $ gain (+) or loss (-) on this individual trade after fees.",
+                ),
+                'Cumulative Gain/Loss $': st.column_config.NumberColumn(
+                    format="$%+.2f",
+                    help="Running total of gains/losses since live start. Final value = total live P&L.",
+                ),
             },
         )
     except FileNotFoundError:
@@ -1292,6 +1326,9 @@ def auto_compute_live():
             )
         }
         return
+    # Fingerprint MUST include every sidebar parameter that affects the output —
+    # otherwise stale cached verdicts are silently returned when the user adjusts
+    # MC seed/block/runs. Bug found in audit: changing mc_seed didn't refresh.
     live_fp = (
         _folder_fp,
         oos_start, oos_end, live_start,
@@ -1300,6 +1337,7 @@ def auto_compute_live():
         float(slippage_bps) if applies_cost else 0.0,
         float(funding_bps) if applies_cost else 0.0,
         int(regime_lookback), float(regime_bull_thr), float(regime_bear_thr),
+        int(mc_n_runs), int(mc_block_len), int(mc_seed),
     )
     if st.session_state.get('live_fp') == live_fp and 'live_view' in st.session_state:
         return
@@ -1324,6 +1362,9 @@ def auto_compute_live():
             regime_lookback=regime_lookback,
             regime_bull_thr=regime_bull_thr,
             regime_bear_thr=regime_bear_thr,
+            mc_n_runs=mc_n_runs,
+            mc_block_len=mc_block_len,
+            mc_seed=mc_seed if mc_seed > 0 else None,
         )
         st.session_state['live_fp'] = live_fp
 
