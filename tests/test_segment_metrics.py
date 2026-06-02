@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from calculations import ANNUALIZATION_FACTOR, segment_metrics
+from calculations import ANNUALIZATION_FACTOR, fold_metrics, segment_metrics
 
 
 class TestSegmentMetricsBasic:
@@ -73,3 +73,34 @@ class TestProfitFactor:
         pnl = pd.Series([5, 10, 3], index=pd.date_range("2024-01-01", periods=3))
         m = segment_metrics(pnl, 1000.0, 0.04)
         assert m['pf'] == 999.0
+
+
+class TestFoldMetrics:
+    """fold_metrics is consumed by the walk-forward heatmap and robustness
+    scorecard — it MUST return the same key set whether or not the input is
+    empty, otherwise the heatmap KeyErrors.
+    """
+
+    def test_fold_metrics_returns_calmar_key(self, synthetic_bull_pnl):
+        """Calmar must be present (default heatmap metric)."""
+        m = fold_metrics(synthetic_bull_pnl, 1000.0, 0.04)
+        assert 'calmar' in m, "fold_metrics must expose 'calmar' for the heatmap"
+
+    def test_fold_metrics_empty_input_also_has_calmar(self):
+        """Empty pnl → still returns dict with calmar=0 (no KeyError downstream)."""
+        m = fold_metrics(pd.Series([], dtype=float), 1000.0, 0.04)
+        assert m['calmar'] == 0.0
+
+    def test_fold_metrics_calmar_is_finite(self, synthetic_bear_pnl):
+        """Bear strategy → Calmar must be finite (not inf or NaN even with deep DD)."""
+        import math
+        m = fold_metrics(synthetic_bear_pnl, 1000.0, 0.04)
+        assert math.isfinite(m['calmar'])
+
+    def test_fold_metrics_calmar_zero_when_no_dd(self):
+        """Monotone-rising equity → MDD=0 → Calmar guarded to 0 (not inf)."""
+        pnl = pd.Series(
+            [5, 10, 15, 20], index=pd.date_range("2024-01-01", periods=4),
+        )
+        m = fold_metrics(pnl, 1000.0, 0.04)
+        assert m['calmar'] == 0.0  # safe value when MDD is zero

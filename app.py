@@ -2205,7 +2205,15 @@ with tab_wf:
             sharpe_threshold = st.number_input("Min Sharpe to count as 'positive'",
                                                value=0.0, step=0.1)
         with cfg4:
-            metric_view = st.selectbox("Heatmap metric", ["Sharpe", "CAGR", "MaxDD", "PF"])
+            # Calmar default — CAGR / |MaxDD| is the most drawdown-aware
+            # single-number metric for walk-forward robustness. A strategy
+            # with high Sharpe but a brutal tail drawdown looks much worse
+            # in Calmar, which is what you want to see in a robustness check.
+            heatmap_metrics = ["Calmar", "Sharpe", "CAGR", "MaxDD", "PF"]
+            metric_view = st.selectbox(
+                "Heatmap metric", heatmap_metrics, index=0,
+                help="Calmar = CAGR / |MaxDD|. Higher = better risk-adjusted return per unit of worst-case pain.",
+            )
 
         with st.spinner(f"Running {n_folds}-fold walk-forward on vol-targeted portfolio..."):
             wf = walk_forward_analysis(
@@ -2232,12 +2240,18 @@ with tab_wf:
             st.dataframe(fold_dates_df, hide_index=True, use_container_width=True)
 
             st.markdown(f"#### 🔥 Strategy × Fold {metric_view} Heatmap")
-            metric_key = {'Sharpe': 'sharpe', 'CAGR': 'cagr', 'MaxDD': 'mdd', 'PF': 'pf'}[metric_view]
+            metric_key = {
+                'Calmar': 'calmar', 'Sharpe': 'sharpe', 'CAGR': 'cagr',
+                'MaxDD': 'mdd', 'PF': 'pf',
+            }[metric_view]
             matrix = pd.DataFrame({
                 f"Fold {i+1}": [wf['strategies'][s][i][metric_key] for s in wf['strategies']]
                 for i in range(n_folds)
             }, index=list(wf['strategies'].keys()))
 
+            # Formatting + colormap midpoint per metric. zmid sets the green/red
+            # threshold: 0 for Sharpe/CAGR/Calmar (positive=green), 1.0 for PF
+            # (>1.0 is profitable), mean of matrix for MaxDD (relative ranking).
             if metric_view == 'CAGR':
                 text = np.array([[f"{v:.1%}" for v in row] for row in matrix.values])
                 zmid = 0
@@ -2247,7 +2261,10 @@ with tab_wf:
             elif metric_view == 'PF':
                 text = np.array([[f"{v:.2f}" for v in row] for row in matrix.values])
                 zmid = 1.0
-            else:
+            elif metric_view == 'Calmar':
+                text = np.array([[f"{v:.2f}" for v in row] for row in matrix.values])
+                zmid = 0
+            else:  # Sharpe
                 text = np.array([[f"{v:.2f}" for v in row] for row in matrix.values])
                 zmid = 0
             colorscale = 'RdYlGn_r' if metric_view == 'MaxDD' else 'RdYlGn'

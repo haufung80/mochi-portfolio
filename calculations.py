@@ -1001,9 +1001,15 @@ def split_into_folds(daily_pnl: pd.Series, n_folds: int
 
 
 def fold_metrics(fold_pnl: pd.Series, capital: float, rfr: float) -> dict:
-    """Key performance metrics for a single fold."""
+    """Key performance metrics for a single fold.
+
+    Includes Calmar (CAGR / |MaxDD|) — risk-adjusted return per unit of
+    worst-case drawdown. A more drawdown-aware sibling of Sharpe; preferred
+    metric for walk-forward robustness when tail risk matters.
+    """
     empty = {
         'sharpe': 0.0, 'sortino': 0.0, 'cagr': 0.0, 'mdd': 0.0,
+        'calmar': 0.0,
         'pf': 0.0, 'win_rate': 0.0, 'n_active_days': 0,
         'total_pnl': 0.0, 'final_equity': float(capital),
     }
@@ -1018,6 +1024,10 @@ def fold_metrics(fold_pnl: pd.Series, capital: float, rfr: float) -> dict:
     final = float(equity.iloc[-1])
     cagr = get_cagr(capital, final, days)
     mdd, _ = get_max_drawdown(equity, capital)
+    # Calmar = CAGR / |MaxDD|. Guard against MDD==0 (no drawdown) and inf.
+    calmar = (cagr / abs(mdd)) if mdd != 0 else 0.0
+    if not np.isfinite(calmar):
+        calmar = 0.0
     nonzero = fold_pnl[fold_pnl != 0]
     pf = profit_factor(nonzero.values) if len(nonzero) else 0.0
     if not np.isfinite(pf):
@@ -1026,6 +1036,7 @@ def fold_metrics(fold_pnl: pd.Series, capital: float, rfr: float) -> dict:
     return {
         'sharpe': float(sharpe), 'sortino': float(sortino),
         'cagr': float(cagr), 'mdd': float(mdd),
+        'calmar': float(calmar),
         'pf': float(pf), 'win_rate': win_rate,
         'n_active_days': int(len(nonzero)),
         'total_pnl': float(fold_pnl.sum()), 'final_equity': final,
