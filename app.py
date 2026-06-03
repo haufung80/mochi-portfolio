@@ -637,16 +637,25 @@ def render_vt_recompute_section(
                 normalize_backtest_pos=False,
             )
             st.session_state['vt_alloc'] = vt
-            # Invalidate dependent caches so they re-derive on next access.
+            # Persist the user's choice so the WHOLE app (Portfolio/Risk tabs via
+            # auto_compute_vt → vt_view) converges on it and it survives sidebar
+            # changes. Also force vt_data_fp stale so auto_compute_vt re-derives
+            # vt_view from these params on the next full rerun.
+            st.session_state['vt_user_params'] = dict(
+                target_ror=vt_target_ror, ruin_fraction=vt_ruin_frac,
+                max_leverage_cap=vt_max_lev_strat, target_portfolio_vol=vt_port_target,
+            )
             for stale_key in (
+                'vt_data_fp',                                  # force vt_view re-derive
                 'mc_fp', 'mc_results', 'mc_start_used', 'mc_ruin_used',
                 'port_env_fp', 'port_env_df',
             ):
                 st.session_state.pop(stale_key, None)
             st.success(
-                "✅ VT recomputed. Downstream caches (MC, envelope) invalidated — "
-                "Portfolio / Risk / MC tabs will reflect new vt on next visit. "
-                "Tab focus preserved (fragment scope)."
+                f"✅ Vol-targeted to {vt_port_target:.0%} — metrics below are live. "
+                "The **Portfolio / Risk tabs** show this sizing after your next "
+                "interaction (e.g. switch tabs then touch any sidebar control) — "
+                "a Streamlit fragment limitation, not stale data."
             )
 
     if 'vt_alloc' not in st.session_state:
@@ -823,13 +832,21 @@ def render_vt_recompute_section(
                     max((port_equity.index[-1] - port_equity.index[0]).days, 1))
     mdd, _ = get_max_drawdown(port_equity, total_cap)
 
+    calmar = cagr / abs(mdd) if mdd != 0 else 0.0
     cost_label = "net of costs" if vt_apply_costs else "gross (no costs)"
-    sf1, sf2, sf3, sf4 = st.columns(4)
+    st.caption(
+        "These update live each time you Compute. **CAGR / MaxDD / Final Eq scale "
+        "with the vol target** (leverage); **Sharpe / Calmar are ~invariant** "
+        "(leverage cancels in a ratio — cost drag nudges them slightly)."
+    )
+    sf1, sf2, sf3, sf4, sf5 = st.columns(5)
     sf1.metric("Vol-targeted CAGR", f"{cagr:.1%}", delta=cost_label, delta_color="off")
     sf2.metric("Vol-targeted Sharpe", f"{sharpe:.2f}",
                delta=f"Sortino {sortino:.2f}", delta_color="off")
-    sf3.metric("Vol-targeted MaxDD", f"{mdd:.1%}", delta_color="inverse")
-    sf4.metric("Vol-targeted Final Eq",
+    sf3.metric("Vol-targeted Calmar", f"{calmar:.2f}",
+               delta="CAGR / |MaxDD|", delta_color="off")
+    sf4.metric("Vol-targeted MaxDD", f"{mdd:.1%}", delta_color="inverse")
+    sf5.metric("Vol-targeted Final Eq",
                f"${float(port_equity.iloc[-1]):,.0f}",
                delta=f"vs gross backtest ${port_stats['Final Equity']:,.0f}",
                delta_color="off")
@@ -1203,10 +1220,19 @@ def auto_compute_vt():
     if plot_data is None or plot_data.empty:
         return
 
+    # The user's manual VT sliders (from the MC tab fragment) persist here so the
+    # WHOLE app — including the Portfolio/Risk tabs via vt_view — stays consistent
+    # with their choice. Without this, any sidebar change would silently revert
+    # the vol-target to the 20% default and the manual recompute would be lost.
+    up = st.session_state.get('vt_user_params') or {}
+    eff_target_ror = up.get('target_ror', VT_DEFAULT_TARGET_ROR)
+    eff_ruin_frac = up.get('ruin_fraction', VT_DEFAULT_RUIN_FRAC)
+    eff_max_lev = up.get('max_leverage_cap', VT_DEFAULT_MAX_LEV)
+    eff_port_vol = up.get('target_portfolio_vol', VT_DEFAULT_PORT_VOL)
+
     # Data fingerprint — recompute when any input that AFFECTS the vol-targeting
-    # changes. MUST include mc_block_len/mc_seed because the computation below
-    # passes them to mc_vol_targeted_allocation — omitting them served stale
-    # Portfolio-tab metrics when the user changed MC params without restarting.
+    # changes. Includes the user's VT params + mc_block_len/mc_seed, so changing
+    # any of them refreshes the Portfolio tab (was the stale-metrics bug).
     data_fp = (
         total_cap, float(risk_free_rate),
         float(cost_bps_rt) if applies_cost else 0.0,
@@ -1215,19 +1241,22 @@ def auto_compute_vt():
         oos_start, oos_end, portfolio_folder,
         plot_data.shape, len(metrics_df),
         int(mc_block_len), int(mc_seed),
+        float(eff_target_ror), float(eff_ruin_frac),
+        float(eff_max_lev), float(eff_port_vol),
     )
     if st.session_state.get('vt_data_fp') == data_fp and 'vt_alloc' in st.session_state:
-        return  # data unchanged, keep current vt (auto or manual)
+        return  # nothing affecting vt changed — keep current
 
-    with st.spinner("Auto-computing MC + Vol Targeting (defaults: RoR≤10%, 40% ruin, max 1x lev, 20% port vol)..."):
+    with st.spinner(f"Auto-computing MC + Vol Targeting (RoR≤{eff_target_ror:.0%}, "
+                    f"{1-eff_ruin_frac:.0%} ruin, max {eff_max_lev:g}x lev, {eff_port_vol:.0%} port vol)..."):
         vt = mc_vol_targeted_allocation(
             plot_data=plot_data,
             metrics_df=metrics_df,
             total_cap=total_cap,
-            target_ror=VT_DEFAULT_TARGET_ROR,
-            ruin_fraction=VT_DEFAULT_RUIN_FRAC,
-            max_leverage_cap=VT_DEFAULT_MAX_LEV,
-            target_portfolio_vol=VT_DEFAULT_PORT_VOL,
+            target_ror=eff_target_ror,
+            ruin_fraction=eff_ruin_frac,
+            max_leverage_cap=eff_max_lev,
+            target_portfolio_vol=eff_port_vol,
             n_runs=VT_DEFAULT_N_RUNS,
             block_len=mc_block_len,
             seed=mc_seed if mc_seed > 0 else None,
