@@ -18,6 +18,7 @@ import pytest
 from calculations import (
     DEFAULT_COST_BPS_RT,
     DEFAULT_SLIPPAGE_BPS,
+    net_live_pnl_from_csv,
     net_of_fees,
     regime_phase_split,
 )
@@ -135,3 +136,32 @@ class TestRegimePhaseSplit:
         assert regime_phase_split(pd.Series([], dtype=float), pd.Series([], dtype=float)) == {}
         idx = pd.date_range("2025-12-03", periods=2, freq="D")
         assert regime_phase_split(pd.Series([1.0, 2.0], index=idx), None) == {}
+
+
+class TestNetLivePnlFromCsv:
+    """End-to-end: read a real-format CSV → net-of-fees live summary.
+
+    Uses the tz_aware_tv_csv fixture (from conftest) which writes a TradingView
+    export with notional and tz-aware timestamps — covers both the cost calc
+    and the tz handling in one path.
+    """
+
+    def test_reads_and_nets_live_segment(self, tz_aware_tv_csv):
+        # Fixture has 30 trades every 10 days from 2024-01-01, notional 500.
+        # Split mid-way so only later exits count as "live".
+        out = net_live_pnl_from_csv(tz_aware_tv_csv, pd.Timestamp("2024-06-01"))
+        assert out['n_trades'] > 0, "should find live exits after split"
+        # fee = n_trades * 500 * (11+2)/10000 = n_trades * 0.65
+        assert out['fees'] == pytest.approx(out['n_trades'] * 500 * 0.0013, abs=1e-6)
+        # net = gross - fees, always
+        assert out['net'] == pytest.approx(out['gross'] - out['fees'], abs=1e-6)
+
+    def test_missing_file_returns_zeros(self, tmp_path):
+        out = net_live_pnl_from_csv(tmp_path / "does_not_exist.csv", pd.Timestamp("2025-12-03"))
+        assert out == {'gross': 0.0, 'fees': 0.0, 'net': 0.0, 'n_trades': 0}
+
+    def test_split_after_all_trades_returns_zeros(self, tz_aware_tv_csv):
+        """Split date after every trade → no live segment → zeros, no crash."""
+        out = net_live_pnl_from_csv(tz_aware_tv_csv, pd.Timestamp("2030-01-01"))
+        assert out['n_trades'] == 0
+        assert out['net'] == 0.0

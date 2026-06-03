@@ -67,6 +67,20 @@ def verdict_category(verdict_string: str) -> str:
     return verdict_string.split(' (', 1)[0].strip()
 
 
+@st.cache_data(show_spinner=False)
+def net_live_summary_cached(folder: str, strat_name: str, split_iso: str,
+                            cost_bps_rt: float, slippage_bps: float, _fp) -> dict:
+    """Cached net-of-fees live summary for one strategy (reads its CSV).
+
+    Keyed on the folder fingerprint `_fp` so it refreshes when CSVs change.
+    Returns {gross, fees, net, n_trades} — all zeros if the CSV is missing.
+    """
+    return calculations.net_live_pnl_from_csv(
+        Path(folder) / f"{strat_name}.csv",
+        pd.Timestamp(split_iso), cost_bps_rt, slippage_bps,
+    )
+
+
 def render_live_drilldown(
     sum_df: pd.DataFrame,
     per_strat_evals: dict,
@@ -1501,9 +1515,20 @@ with tab_live:
             st.info("No per-strategy evaluations available yet.")
         else:
             per_strat_cap = per_strategy_capital(total_cap, len(per_strat_evals))
+            # Net-of-fees: TradingView P&L is GROSS. Apply round-trip cost so the
+            # displayed Live % reflects what the strategy actually nets. Uses the
+            # sidebar cost assumptions (defaults to the 11+2 bps model).
+            _net_cost_rt = cost_bps_rt if cost_bps_rt else calculations.DEFAULT_COST_BPS_RT
+            _net_slip = slippage_bps if slippage_bps else calculations.DEFAULT_SLIPPAGE_BPS
             summary_rows = []
             for col, ev in per_strat_evals.items():
-                live_pct = live_pct_bt_end_based(ev, per_strat_cap)
+                gross_pct = live_pct_bt_end_based(ev, per_strat_cap)
+                bt_end_eq = per_strat_cap + ev['bt_metrics']['total_pnl']
+                nl = net_live_summary_cached(
+                    portfolio_folder, col, str(split_date.date()),
+                    _net_cost_rt, _net_slip, _folder_fp,
+                )
+                net_pct = (nl['net'] / bt_end_eq * 100.0) if bt_end_eq > 0 else 0.0
                 summary_rows.append({
                     'Strategy': extract_family(col),
                     'Ticker': extract_ticker(col),
@@ -1514,7 +1539,9 @@ with tab_live:
                     'MC Return %ile': ev['mc_return_percentile'],
                     'KS p': ev.get('ks_p'),
                     'Live Trades': ev.get('live_trades', ev['live_metrics']['n_active_days']),
-                    'Live %': live_pct,
+                    'Live % (net)': net_pct,
+                    'Live % (gross)': gross_pct,
+                    'Fees $': nl['fees'],
                     'Live MDD %': ev['live_metrics']['mdd'] * 100,
                     'Days Since Last Trade': ev['live_metrics']['days_since_last_trade'] or 0,
                     '_full_name': col,
@@ -1583,13 +1610,26 @@ with tab_live:
                         help="Active live trading days. Kill rule requires ≥20 to avoid "
                              "small-sample false positives. Below 20 → ⏳ INCUBATING.",
                     ),
-                    'Live %': st.column_config.NumberColumn(
+                    'Live % (net)': st.column_config.NumberColumn(
                         format="%+.1f%%",
-                        help="Live total P&L as % of starting capital (per-strategy capital = total / N strategies).",
+                        help="Live P&L NET of round-trip trading costs, as % of BT-end equity. "
+                             "TradingView P&L is gross — this subtracts the modeled fee+slippage. "
+                             "THIS is the real number to judge profitability on.",
+                    ),
+                    'Live % (gross)': st.column_config.NumberColumn(
+                        format="%+.1f%%",
+                        help="Live P&L BEFORE costs (raw TradingView 'Net P&L USDT'). "
+                             "Compare to 'Live % (net)' to see the fee drag.",
+                    ),
+                    'Fees $': st.column_config.NumberColumn(
+                        format="$%.0f",
+                        help="Total round-trip trading cost over the live segment "
+                             "(|notional| × (fee+slip) bps per trade). High-frequency "
+                             "strategies pay the most — this is what flips marginal edges negative.",
                     ),
                     'Live MDD %': st.column_config.NumberColumn(
                         format="%.2f%%",
-                        help="Live segment maximum drawdown, as % of starting capital.",
+                        help="Live segment maximum drawdown (gross), as % of peak equity.",
                     ),
                     'Days Since Last Trade': st.column_config.NumberColumn(format="%d"),
                 },

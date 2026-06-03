@@ -1262,6 +1262,55 @@ def net_of_fees(gross_pnl, notional,
     return net, float(fee.sum())
 
 
+def net_live_pnl_from_csv(csv_path, split_date,
+                          cost_bps_rt: float = DEFAULT_COST_BPS_RT,
+                          slippage_bps: float = DEFAULT_SLIPPAGE_BPS) -> dict:
+    """Read one strategy CSV → net-of-fees summary for its LIVE segment.
+
+    Bridges the gap that made the gross-vs-net audit necessary: the live table
+    was showing gross 'Net P&L USDT'. This re-reads the trade-level CSV (which
+    has the position notional), applies ``net_of_fees`` per trade, and returns
+    the live-segment totals.
+
+    Args:
+        csv_path: path to the strategy's TradingView CSV.
+        split_date: live segment starts here (exits on/after this date).
+        cost_bps_rt / slippage_bps: round-trip cost model (bps).
+
+    Returns:
+        dict {gross, fees, net, n_trades}. All zeros if the file is missing /
+        unreadable / has no live exits (graceful — the UI degrades to showing
+        zeros rather than crashing).
+    """
+    blank = {'gross': 0.0, 'fees': 0.0, 'net': 0.0, 'n_trades': 0}
+    try:
+        raw = pd.read_csv(csv_path)
+    except Exception:
+        return blank
+    raw = _normalize_tv_columns(raw)
+    if 'Date/Time' not in raw.columns or 'Net P&L USDT' not in raw.columns:
+        return blank
+    raw['Date/Time'] = pd.to_datetime(raw['Date/Time'], errors='coerce')
+    if isinstance(raw['Date/Time'].dtype, pd.DatetimeTZDtype):
+        raw['Date/Time'] = raw['Date/Time'].dt.tz_localize(None)
+    split = pd.Timestamp(split_date)
+    exits = raw[(raw['Date/Time'] >= split) &
+                (raw['Type'].astype(str).str.startswith('Exit', na=False))]
+    if exits.empty:
+        return blank
+    gross = pd.to_numeric(exits['Net P&L USDT'], errors='coerce').fillna(0).values
+    notional = pd.to_numeric(
+        exits.get('Position size (value)', pd.Series(0.0, index=exits.index)),
+        errors='coerce').fillna(0).values
+    net, total_fee = net_of_fees(gross, notional, cost_bps_rt, slippage_bps)
+    return {
+        'gross': float(gross.sum()),
+        'fees': float(total_fee),
+        'net': float(net.sum()),
+        'n_trades': int(len(exits)),
+    }
+
+
 def regime_phase_split(daily_pnl: pd.Series, regime_series: pd.Series) -> dict:
     """Bucket daily P&L by regime label → per-regime performance.
 
