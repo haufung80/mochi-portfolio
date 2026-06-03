@@ -97,6 +97,21 @@ class TestSidebarReadsConstants:
         from pathlib import Path
         return (Path(__file__).resolve().parent.parent / 'app.py').read_text()
 
+    def test_vt_cache_fingerprint_includes_mc_params(self):
+        """auto_compute_vt passes mc_block_len/mc_seed to the computation, so its
+        cache fingerprint MUST include them — else changing MC params in the
+        sidebar serves stale Portfolio-tab metrics (no recompute).
+        """
+        src = self._app_src()
+        # isolate the auto_compute_vt function body, then the data_fp tuple within it
+        start = src.index('def auto_compute_vt(')
+        end = src.index('\nauto_compute_vt()', start)
+        body = src[start:end]
+        fp_start = body.index('data_fp = (')
+        fp = body[fp_start:body.index('if st.session_state', fp_start)]
+        assert 'mc_block_len' in fp, "vt data_fp must include mc_block_len"
+        assert 'mc_seed' in fp, "vt data_fp must include mc_seed"
+
     def test_sidebar_uses_constants_not_literals(self):
         src = self._app_src()
         for ref in [

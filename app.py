@@ -1203,7 +1203,10 @@ def auto_compute_vt():
     if plot_data is None or plot_data.empty:
         return
 
-    # Data fingerprint — recompute only when underlying portfolio data changes
+    # Data fingerprint — recompute when any input that AFFECTS the vol-targeting
+    # changes. MUST include mc_block_len/mc_seed because the computation below
+    # passes them to mc_vol_targeted_allocation — omitting them served stale
+    # Portfolio-tab metrics when the user changed MC params without restarting.
     data_fp = (
         total_cap, float(risk_free_rate),
         float(cost_bps_rt) if applies_cost else 0.0,
@@ -1211,6 +1214,7 @@ def auto_compute_vt():
         float(funding_bps) if applies_cost else 0.0,
         oos_start, oos_end, portfolio_folder,
         plot_data.shape, len(metrics_df),
+        int(mc_block_len), int(mc_seed),
     )
     if st.session_state.get('vt_data_fp') == data_fp and 'vt_alloc' in st.session_state:
         return  # data unchanged, keep current vt (auto or manual)
