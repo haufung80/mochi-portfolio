@@ -1211,6 +1211,88 @@ def per_strategy_regime_pnl(plot_data: pd.DataFrame, regime: pd.Series) -> pd.Da
 
 
 # ============================================================================
+# COST MODEL — net-of-fees on realized trades
+# ============================================================================
+
+# Default Bybit-perp cost assumptions (round-trip). These mirror the defaults
+# used by mc_vol_targeted_allocation so net figures are consistent app-wide.
+DEFAULT_COST_BPS_RT = 11.0    # exchange fee, round trip
+DEFAULT_SLIPPAGE_BPS = 2.0    # per-trade slippage
+
+
+def net_of_fees(gross_pnl, notional,
+                cost_bps_rt: float = DEFAULT_COST_BPS_RT,
+                slippage_bps: float = DEFAULT_SLIPPAGE_BPS):
+    """Subtract round-trip trading cost from gross per-trade P&L.
+
+    TradingView's 'Net P&L USDT' is GROSS when no commission is configured in
+    the strategy (these exports have no commission column). This applies the
+    same cost model as ``mc_vol_targeted_allocation`` but in DOLLAR space on
+    realized trades:
+
+        fee_i = |notional_i| * (cost_bps_rt + slippage_bps) / 10000
+        net_i = gross_i - fee_i
+
+    Funding is intentionally NOT included here — it needs entry/exit matching
+    to know holding days, and round-trip fee+slippage is the dominant cost at
+    these trade frequencies. Callers wanting funding should add it separately.
+
+    Args:
+        gross_pnl: per-trade gross P&L (Series or 1-D array).
+        notional:  per-trade position notional, same length (Series or array).
+                   Sign is ignored — cost is charged on |notional|.
+        cost_bps_rt: round-trip exchange fee in bps (default 11).
+        slippage_bps: per-trade slippage in bps (default 2).
+
+    Returns:
+        (net_pnl: np.ndarray, total_fee: float) — net per-trade P&L array and
+        the summed dollar fee. On length mismatch raises ValueError; on empty
+        input returns (empty array, 0.0).
+    """
+    g = np.asarray(gross_pnl, dtype=float)
+    n = np.abs(np.asarray(notional, dtype=float))
+    if g.shape != n.shape:
+        raise ValueError(f"length mismatch: {g.shape} gross_pnl vs {n.shape} notional")
+    if g.size == 0:
+        return np.array([]), 0.0
+    if cost_bps_rt < 0 or slippage_bps < 0:
+        raise ValueError("cost_bps_rt and slippage_bps must be non-negative")
+    fee = n * (cost_bps_rt + slippage_bps) / 10000.0
+    net = g - fee
+    return net, float(fee.sum())
+
+
+def regime_phase_split(daily_pnl: pd.Series, regime_series: pd.Series) -> dict:
+    """Bucket daily P&L by regime label → per-regime performance.
+
+    Generalizes the "did it recover when its regime returned?" test so it works
+    with ANY regime Series — the global BTC regime OR the traded ticker's own
+    regime (from ``fetch_ticker_regime``). The latter is fairer for SOL/ETH
+    strategies whose home market can diverge from BTC.
+
+    Args:
+        daily_pnl: daily P&L Series indexed by date.
+        regime_series: regime labels ('Bull'/'Bear'/'Chop') indexed by date.
+                       Reindexed onto daily_pnl's dates with forward-fill.
+
+    Returns:
+        dict {regime_label: {'pnl': float, 'days': int, 'per_day': float}} for
+        each label present in the overlap. Empty dict if no overlap.
+    """
+    pnl = pd.Series(daily_pnl).fillna(0)
+    if pnl.empty or regime_series is None or len(regime_series) == 0:
+        return {}
+    reg = pd.Series(regime_series).reindex(pnl.index).ffill()
+    out = {}
+    for lbl in reg.dropna().unique():
+        mask = (reg == lbl)
+        d = int(mask.sum())
+        p = float(pnl[mask].sum())
+        out[str(lbl)] = {'pnl': p, 'days': d, 'per_day': (p / d if d else 0.0)}
+    return out
+
+
+# ============================================================================
 # LIVE INCUBATION MONITORING
 # ============================================================================
 # Honest live-vs-backtest monitoring.
