@@ -62,6 +62,83 @@ TV_COLUMN_ALIASES = {
     'Size (value)': 'Position size (value)',
 }
 
+# ============================================================================
+# MODULE CONSTANTS — SINGLE SOURCE OF TRUTH for the whole dashboard.
+# Defined at the top so EVERY function signature default and EVERY app.py
+# sidebar default can reference them. Change a value here → it propagates to
+# calculations, the sidebar, the auto-compute, and the analysis scripts.
+# ============================================================================
+
+# Default split date — strategies went OOS live on this date.
+LIVE_START_DEFAULT = '2025-12-03'
+
+# ── Cost model (Binance perp; data is Binance) ──────────────────────────────
+# Verified: the amortized (tpy×cost×pos/365) and per-trade (Σ cost×|notional|)
+# models reconcile to <1% at the same scale, so net figures agree app-wide.
+DEFAULT_COST_BPS_RT = 10.0          # exchange fee, round trip (taker 5bps×2)
+DEFAULT_SLIPPAGE_BPS = 2.0          # per-trade slippage
+DEFAULT_FUNDING_BPS_PER_DAY = 0.5   # perp funding (amortized model only)
+
+# ── Kill-rule MC envelope thresholds (percent units, 0–100) ─────────────────
+MC_TAIL_PCT = 5        # ≤5% on either MC %ile fires KILL
+MC_WARN_PCT = 15       # ≤15% on either MC %ile fires WARN (subordinate to KILL)
+MIN_LIVE_TRADES = 20   # min live active-trading days before the HARD kill rule applies
+# Softer floor for INFORMATIONAL verdicts (regime-conditional health, pair
+# divergence). Deliberately lower than MIN_LIVE_TRADES: these are advisory
+# signals, not binary kill decisions, so they surface earlier with less data.
+MIN_LIVE_TRADES_SOFT = 10
+
+# ── KS / Edge-Diagnosis sample-size floors + significance ───────────────────
+KS_ALPHA = 0.05               # KS p below this → distribution-shift signal
+MIN_BT_TRADES_FOR_KS = 20     # need ≥20 BT trades for KS to have power
+MIN_LIVE_TRADES_FOR_KS = 5    # need ≥5 live trades to compare distributions
+
+# ── Rolling window for Sharpe / Calmar charts ───────────────────────────────
+ROLLING_WINDOW_DAYS = 60
+
+# ── Annualization ───────────────────────────────────────────────────────────
+# TRADING_DAYS_PER_YEAR annualizes daily RATES (crypto trades 24/7 → 365, not
+# 252). CALENDAR_DAYS_PER_YEAR is leap-year-accurate "years elapsed" for CAGR.
+# Both explicit so the 365-vs-365.25 split is intentional, not accidental.
+TRADING_DAYS_PER_YEAR = 365
+ANNUALIZATION_FACTOR = float(np.sqrt(TRADING_DAYS_PER_YEAR))  # ≈ 19.105
+CALENDAR_DAYS_PER_YEAR = 365.25
+
+# ── MC bootstrap defaults (per-strategy eval, portfolio envelope, sidebar) ──
+MC_DEFAULT_RUNS = 1000
+MC_DEFAULT_BLOCK_LEN = 5
+MC_DEFAULT_SEED = 42
+
+# ── Risk-free rate (annualized) ─────────────────────────────────────────────
+DEFAULT_RFR = 0.04
+
+# ── Regime classification (BTC 60-day trailing return, ±10% bands) ──────────
+REGIME_DEFAULT_LOOKBACK = 60
+REGIME_DEFAULT_BULL_THR = 0.10
+REGIME_DEFAULT_BEAR_THR = -0.10
+
+# ── Vol-targeting (MC + risk-parity) defaults ───────────────────────────────
+VT_DEFAULT_TARGET_ROR = 0.10    # per-strategy target Risk of Ruin
+VT_DEFAULT_RUIN_FRAC = 0.60     # ruin = 40% loss (1 - 0.60)
+VT_DEFAULT_MAX_LEV = 1.0        # per-strategy leverage cap
+VT_DEFAULT_PORT_VOL = 0.20      # target annualized portfolio vol
+VT_DEFAULT_N_RUNS = 1000
+
+# ── Default starting capital ────────────────────────────────────────────────
+DEFAULT_CAPITAL = 2000.0
+
+# ── Verdict color palette (single source) ───────────────────────────────────
+VERDICT_COLORS = {
+    'kill':       '#c0392b',   # red — kill / disqualified / broken edge
+    'warn':       '#f39c12',   # amber — borderline
+    'watch':      '#f1c40f',   # yellow — secondary attention
+    'keep':       '#27ae60',   # green — qualified / stable
+    'neutral':    '#7f8c8d',   # grey — BT reference / informational
+    'incubating': '#95a5a6',   # grey — insufficient data
+    'edge_drift': '#e67e22',   # orange — distribution drifting
+    'axis':       '#34495e',   # dark grey — axes / reference lines
+}
+
 
 def _normalize_tv_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Rename new-format TradingView columns to canonical names. Idempotent."""
@@ -88,9 +165,9 @@ def extract_direction(filename: str) -> str:
 
 
 def _fetch_ticker_regime(ticker: str, start: str, end: str,
-                         lookback: int = 30,
-                         bull_threshold: float = 0.05,
-                         bear_threshold: float = -0.05) -> pd.Series:
+                         lookback: int = REGIME_DEFAULT_LOOKBACK,
+                         bull_threshold: float = REGIME_DEFAULT_BULL_THR,
+                         bear_threshold: float = REGIME_DEFAULT_BEAR_THR) -> pd.Series:
     """Fetch a ticker's daily price from Binance, classify each day into
     Bull/Bear/Chop using a rolling-return lookback. Returns empty series on
     fetch failure.
@@ -176,7 +253,7 @@ def get_cagr(start_val: float, end_val: float, days: int) -> float:
     """CAGR; returns simple ROI for periods under 0.5y to avoid distortion."""
     if days < 1 or start_val <= 0 or end_val <= 0:
         return 0.0
-    years = days / 365.25
+    years = days / CALENDAR_DAYS_PER_YEAR
     if years < 0.5:
         return (end_val / start_val) - 1
     try:
@@ -223,7 +300,7 @@ def get_risk_ratios(daily_returns: pd.Series, risk_free_annual: float) -> Tuple[
     """Annualized Sharpe and Sortino."""
     if daily_returns.empty or daily_returns.std() == 0:
         return 0.0, 0.0
-    rf_daily = risk_free_annual / 365.0
+    rf_daily = risk_free_annual / TRADING_DAYS_PER_YEAR
     excess = daily_returns - rf_daily
     sharpe = float((excess.mean() / daily_returns.std()) * ANNUALIZATION_FACTOR)
     downside = np.minimum(0, excess)
@@ -329,9 +406,9 @@ def get_yearly_returns(equity_series: pd.Series) -> pd.Series:
 
 
 def rolling_sharpe(daily_returns: pd.Series, window: int = 30,
-                   risk_free_annual: float = 0.04) -> pd.Series:
+                   risk_free_annual: float = DEFAULT_RFR) -> pd.Series:
     """Rolling annualized Sharpe."""
-    rf_daily = risk_free_annual / 365.0
+    rf_daily = risk_free_annual / TRADING_DAYS_PER_YEAR
     excess = daily_returns - rf_daily
     return (excess.rolling(window).mean() / daily_returns.rolling(window).std()) * ANNUALIZATION_FACTOR
 
@@ -349,7 +426,7 @@ def rolling_calmar(daily_pnl: pd.Series, starting_capital: float,
         return pd.Series(dtype=float, index=getattr(daily_pnl, 'index', None))
     eq = daily_pnl.fillna(0).cumsum() + starting_capital
     out = pd.Series(np.nan, index=eq.index, dtype=float)
-    years_per_window = window / 365.25
+    years_per_window = window / CALENDAR_DAYS_PER_YEAR
     for i in range(window - 1, len(eq)):
         win = eq.iloc[i - window + 1 : i + 1]
         start_v = float(win.iloc[0])
@@ -444,7 +521,8 @@ def simulate_year(trade_pnls: np.ndarray, start_equity: float, ruin_equity: floa
 
 def monte_carlo(trade_pnls: np.ndarray, start_equity: float, ruin_equity: float,
                 trades_per_year: int, n_runs: int = 2500,
-                seed: Optional[int] = 42, block_len: int = 3) -> dict:
+                seed: Optional[int] = MC_DEFAULT_SEED,
+                block_len: int = 3) -> dict:  # block=3 trades (trade-level, not daily)
     """Run n_runs simulations of 1-year horizons."""
     rng = np.random.default_rng(seed)
     finals, rets, mdds_d, mdds_p, ruins, pfs, paths = [], [], [], [], [], [], []
@@ -470,9 +548,11 @@ def monte_carlo(trade_pnls: np.ndarray, start_equity: float, ruin_equity: float,
 
 
 def find_max_safe_leverage(pct_returns_net: np.ndarray, trades_per_year: int,
-                           target_ror: float = 0.10, ruin_fraction: float = 0.60,
-                           n_runs: int = 500, block_len: int = 5,
-                           seed: Optional[int] = 42,
+                           target_ror: float = VT_DEFAULT_TARGET_ROR,
+                           ruin_fraction: float = VT_DEFAULT_RUIN_FRAC,
+                           n_runs: int = 500,  # inner binary-search — fewer runs for speed
+                           block_len: int = MC_DEFAULT_BLOCK_LEN,
+                           seed: Optional[int] = MC_DEFAULT_SEED,
                            leverage_min: float = 0.01, leverage_max: float = 10.0,
                            tolerance: float = 0.02) -> Tuple[float, float]:
     """Binary-search the max leverage where RoR <= target.
@@ -610,7 +690,7 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
                 wins = exit_pnls[exit_pnls > 0]
                 losses = exit_pnls[exit_pnls < 0]
                 n_trades = int(len(exit_pnls))
-                trades_per_year = (n_trades / max(days, 1)) * 365.25
+                trades_per_year = (n_trades / max(days, 1)) * CALENDAR_DAYS_PER_YEAR
                 win_rate = float(len(wins) / n_trades) if n_trades > 0 else 0.0
                 avg_win = float(wins.mean()) if len(wins) else 0.0
                 avg_loss = float(losses.mean()) if len(losses) else 0.0
@@ -732,11 +812,13 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
 
 def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
                                total_cap: float,
-                               target_ror: float = 0.10, ruin_fraction: float = 0.60,
-                               max_leverage_cap: float = 1.0,
-                               target_portfolio_vol: float = 0.20,
-                               n_runs: int = 1000, block_len: int = 5,
-                               seed: Optional[int] = 42,
+                               target_ror: float = VT_DEFAULT_TARGET_ROR,
+                               ruin_fraction: float = VT_DEFAULT_RUIN_FRAC,
+                               max_leverage_cap: float = VT_DEFAULT_MAX_LEV,
+                               target_portfolio_vol: float = VT_DEFAULT_PORT_VOL,
+                               n_runs: int = VT_DEFAULT_N_RUNS,
+                               block_len: int = MC_DEFAULT_BLOCK_LEN,
+                               seed: Optional[int] = MC_DEFAULT_SEED,
                                cost_bps_per_round_trip: float = 0.0,
                                slippage_bps: float = 0.0,
                                funding_bps_per_day: float = 0.0,
@@ -790,7 +872,7 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
 
     cost_pct = (cost_bps_per_round_trip + slippage_bps) / 10000.0
     funding_pct_per_day = funding_bps_per_day / 10000.0
-    annual_funding_pct = funding_pct_per_day * 365.0
+    annual_funding_pct = funding_pct_per_day * TRADING_DAYS_PER_YEAR
 
     safe_leverage = {}
     achieved_rors = {}
@@ -873,7 +955,7 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
             if pos <= 0:
                 continue
             tpy = max(int(metrics_df.loc[col, 'Trades/Yr']), 1) if 'Trades/Yr' in metrics_df.columns else 0
-            daily_trade_cost = (tpy * cost_pct * pos) / 365.0
+            daily_trade_cost = (tpy * cost_pct * pos) / TRADING_DAYS_PER_YEAR
             daily_funding_cost = funding_pct_per_day * pos
             port_pnl = port_pnl - (daily_trade_cost + daily_funding_cost)
 
@@ -1136,9 +1218,10 @@ def deflated_sharpe(observed_sharpe: float, n_trials: int, n_obs: int,
 # REGIME ANALYSIS (BTC-trend conditional)
 # ============================================================================
 
-def classify_regimes(btc_equity: pd.Series, lookback: int = 30,
-                     bull_threshold: float = 0.05,
-                     bear_threshold: float = -0.05) -> pd.Series:
+def classify_regimes(btc_equity: pd.Series,
+                     lookback: int = REGIME_DEFAULT_LOOKBACK,
+                     bull_threshold: float = REGIME_DEFAULT_BULL_THR,
+                     bear_threshold: float = REGIME_DEFAULT_BEAR_THR) -> pd.Series:
     """Bucket each day into Bull / Bear / Chop based on BTC rolling return."""
     if btc_equity.empty:
         return pd.Series(dtype=object)
@@ -1212,21 +1295,8 @@ def per_strategy_regime_pnl(plot_data: pd.DataFrame, regime: pd.Series) -> pd.Da
 
 # ============================================================================
 # COST MODEL — net-of-fees on realized trades
+# (cost constants live in the MODULE CONSTANTS block at the top of this file)
 # ============================================================================
-
-# ── COST MODEL — SINGLE SOURCE OF TRUTH ─────────────────────────────────────
-# These constants are THE canonical cost assumptions for the entire dashboard.
-# The sidebar number_inputs default to these (app.py reads them), so the
-# vol-targeting amortized model, the per-trade net_of_fees model, and every
-# displayed net figure all use the same bps unless the user overrides in the UI.
-#
-# Data is Binance perp: taker fee 5bps/side → 10bps round trip. Verified that
-# the amortized (tpy×cost×pos/365) and per-trade (Σ cost×|notional|) models
-# agree to within 1% at the same scale, so net figures reconcile app-wide.
-DEFAULT_COST_BPS_RT = 10.0          # exchange fee, round trip (Binance taker 5bps×2)
-DEFAULT_SLIPPAGE_BPS = 2.0          # per-trade slippage
-DEFAULT_FUNDING_BPS_PER_DAY = 0.5   # perp funding (used by the amortized model only)
-
 
 def net_of_fees(gross_pnl, notional,
                 cost_bps_rt: float = DEFAULT_COST_BPS_RT,
@@ -1363,52 +1433,8 @@ def regime_phase_split(daily_pnl: pd.Series, regime_series: pd.Series) -> dict:
 # Helpers below produce per-segment metrics, statistical drift tests
 # (Kolmogorov-Smirnov, Mann-Whitney U), and rule-based health classification.
 
-# Default split date — strategies went OOS live on this date.
-LIVE_START_DEFAULT = '2025-12-03'
-
-# ============================================================================
-# KILL-RULE CONSTANTS (single source of truth — referenced in app.py captions
-# and column tooltips. Change here, propagate everywhere.)
-# ============================================================================
-
-# MC envelope thresholds (percent units, 0–100)
-MC_TAIL_PCT = 5        # ≤5% on either MC %ile fires KILL
-MC_WARN_PCT = 15       # ≤15% on either MC %ile fires WARN (subordinate to KILL)
-
-# Sample-size floor — guard against small-sample false positives
-MIN_LIVE_TRADES = 20   # min live active-trading days before kill rule applies
-
-# KS test sample-size floors and significance level (Edge Diagnosis)
-KS_ALPHA = 0.05               # KS p-value below this → "shift" signal
-MIN_BT_TRADES_FOR_KS = 20     # need ≥20 BT trades for KS to have any power
-MIN_LIVE_TRADES_FOR_KS = 5    # need ≥5 live trades to compare distributions
-
-# Rolling-window length for Sharpe / Calmar charts (days)
-ROLLING_WINDOW_DAYS = 60
-
-# Annualization for crypto Sharpe / Sortino / vol — 365 day year (NOT 252).
-# Crypto trades 24/7, so all 365 days are trading days. Promoting this from
-# 10 inline `np.sqrt(365)` literals to a single constant makes the daily-vs-
-# annual unit assumption explicit and easy to change.
-TRADING_DAYS_PER_YEAR = 365
-ANNUALIZATION_FACTOR = float(np.sqrt(TRADING_DAYS_PER_YEAR))  # ≈ 19.105
-
-# Default MC bootstrap params for per-strategy evaluation
-MC_DEFAULT_RUNS = 1000
-MC_DEFAULT_BLOCK_LEN = 5
-MC_DEFAULT_SEED = 42
-
-# Verdict color palette (single source — duplicated 89× across files before)
-VERDICT_COLORS = {
-    'kill':       '#c0392b',   # red — kill / disqualified / broken edge
-    'warn':       '#f39c12',   # amber — borderline
-    'watch':      '#f1c40f',   # yellow — secondary attention
-    'keep':       '#27ae60',   # green — qualified / stable
-    'neutral':    '#7f8c8d',   # grey — BT reference / informational
-    'incubating': '#95a5a6',   # grey — insufficient data
-    'edge_drift': '#e67e22',   # orange — distribution drifting
-    'axis':       '#34495e',   # dark grey — axes / reference lines
-}
+# (All module constants — kill-rule, MC, regime, VT, cost, colors — are defined
+#  at the TOP of this file so every function signature can reference them.)
 
 
 # ============================================================================
@@ -1481,7 +1507,7 @@ class StrategyEvaluation:
 
 
 def segment_metrics(daily_pnl: pd.Series, starting_capital: float,
-                    rfr: float = 0.04) -> dict:
+                    rfr: float = DEFAULT_RFR) -> dict:
     """Comprehensive metrics for one daily-P&L segment (backtest OR live).
 
     Returns dict with: n_days, n_active_days, total_pnl, final_equity,
@@ -1518,7 +1544,7 @@ def segment_metrics(daily_pnl: pd.Series, starting_capital: float,
     first_trade = nonzero.index[0] if n_active else None
     last_trade = nonzero.index[-1] if n_active else None
     days_since = (pnl.index[-1] - last_trade).days if last_trade is not None else None
-    tpy = (n_active / max(days_span, 1)) * 365.25
+    tpy = (n_active / max(days_span, 1)) * CALENDAR_DAYS_PER_YEAR
     return {
         'n_days': n_days, 'n_active_days': n_active,
         'total_pnl': float(pnl.sum()),
@@ -1720,7 +1746,7 @@ def sharpe_standard_error(sharpe_annualized: float, n_obs: int,
 
 def regime_conditional_health_status(live_m: dict, expected: dict,
                                        bt_m: dict, drift: dict,
-                                       min_live_trades: int = 10,
+                                       min_live_trades: int = MIN_LIVE_TRADES_SOFT,
                                        direction: str = 'BOTH',
                                        ticker_live_bear_tilt: Optional[float] = None,
                                        ticker_live_price_change: Optional[float] = None) -> Tuple[str, str, str]:
@@ -2168,8 +2194,9 @@ def _drawdown_budget_used(live_mdd: float, bt_mdd: float) -> Optional[float]:
 
 def bootstrap_equity_envelope(bt_daily_pnl: pd.Series, n_live_days: int,
                                 starting_equity: float = 0.0,
-                                n_sims: int = 1000, seed: Optional[int] = 42,
-                                block_len: int = 5) -> pd.DataFrame:
+                                n_sims: int = MC_DEFAULT_RUNS,
+                                seed: Optional[int] = MC_DEFAULT_SEED,
+                                block_len: int = MC_DEFAULT_BLOCK_LEN) -> pd.DataFrame:
     """Block-bootstrap simulated equity paths for `n_live_days` using BT daily P&L.
 
     Generates `n_sims` paths by sampling blocks of length `block_len` from the
@@ -2266,7 +2293,7 @@ def _pair_divergence_verdict(bt_corr: float, live_corr: float,
                               live_pnls: dict, n_live_active: int,
                               direction: str = 'BOTH',
                               ticker_live_regime_mix: Optional[dict] = None,
-                              min_live_active: int = 10) -> Tuple[str, str, str]:
+                              min_live_active: int = MIN_LIVE_TRADES_SOFT) -> Tuple[str, str, str]:
     """Interpret pair divergence + per-ticker live outcomes into a verdict.
 
     Critical: considers strategy DIRECTION + each ticker's LIVE REGIME mix.
@@ -2435,8 +2462,9 @@ def fetch_ticker_prices(ticker: str, start: str, end: str) -> pd.Series:
 
 
 def strategy_monte_carlo(bt_daily_pnl: pd.Series, n_horizon_days: int,
-                          n_runs: int = 1000, block_len: int = 5,
-                          seed: Optional[int] = 42) -> dict:
+                          n_runs: int = MC_DEFAULT_RUNS,
+                          block_len: int = MC_DEFAULT_BLOCK_LEN,
+                          seed: Optional[int] = MC_DEFAULT_SEED) -> dict:
     """Block-bootstrap N paths of `n_horizon_days` from backtest daily P&L.
 
     For each simulated path computes:
@@ -2989,9 +3017,9 @@ def live_monitoring_analysis(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
                               total_cap: float, rfr: float,
                               live_start: str,
                               vt_kwargs: Optional[dict] = None,
-                              regime_lookback: int = 60,
-                              regime_bull_thr: float = 0.10,
-                              regime_bear_thr: float = -0.10,
+                              regime_lookback: int = REGIME_DEFAULT_LOOKBACK,
+                              regime_bull_thr: float = REGIME_DEFAULT_BULL_THR,
+                              regime_bear_thr: float = REGIME_DEFAULT_BEAR_THR,
                               mc_n_runs: int = MC_DEFAULT_RUNS,
                               mc_block_len: int = MC_DEFAULT_BLOCK_LEN,
                               mc_seed: Optional[int] = MC_DEFAULT_SEED) -> dict:
@@ -3067,13 +3095,13 @@ def live_monitoring_analysis(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
 
     # --- Step 2: Vol-target on backtest only ---
     vt_kwargs = vt_kwargs or {}
-    vt_kwargs.setdefault('target_ror', 0.10)
-    vt_kwargs.setdefault('ruin_fraction', 0.60)
-    vt_kwargs.setdefault('max_leverage_cap', 1.0)
-    vt_kwargs.setdefault('target_portfolio_vol', 0.20)
-    vt_kwargs.setdefault('n_runs', 1000)
-    vt_kwargs.setdefault('block_len', 5)
-    vt_kwargs.setdefault('seed', 42)
+    vt_kwargs.setdefault('target_ror', VT_DEFAULT_TARGET_ROR)
+    vt_kwargs.setdefault('ruin_fraction', VT_DEFAULT_RUIN_FRAC)
+    vt_kwargs.setdefault('max_leverage_cap', VT_DEFAULT_MAX_LEV)
+    vt_kwargs.setdefault('target_portfolio_vol', VT_DEFAULT_PORT_VOL)
+    vt_kwargs.setdefault('n_runs', VT_DEFAULT_N_RUNS)
+    vt_kwargs.setdefault('block_len', MC_DEFAULT_BLOCK_LEN)
+    vt_kwargs.setdefault('seed', MC_DEFAULT_SEED)
     vt_kwargs.setdefault('normalize_backtest_pos', False)
 
     vt_bt = mc_vol_targeted_allocation(
@@ -3107,7 +3135,7 @@ def live_monitoring_analysis(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
                 if col in bt_metrics_df.index and 'Trades/Yr' in bt_metrics_df.columns
                 else 0
             )
-            daily_trade_cost = (max(tpy, 1) * cost_pct * target_pos) / 365.0
+            daily_trade_cost = (max(tpy, 1) * cost_pct * target_pos) / TRADING_DAYS_PER_YEAR
             daily_funding = funding_pct_day * target_pos
             live_port_pnl = live_port_pnl - (daily_trade_cost + daily_funding)
 
@@ -3252,7 +3280,7 @@ def _metrics_from_pnl_only(plot_data_subset: pd.DataFrame,
         n_active = int(len(nonzero))
         if n_active < 1:
             continue
-        tpy = (n_active / days_span) * 365.25
+        tpy = (n_active / days_span) * CALENDAR_DAYS_PER_YEAR
         # Avg Position $ is taken from full metrics_df (per-trade size is regime-stable)
         avg_pos = (
             float(full_metrics_df.loc[col, 'Avg Position $'])
@@ -3327,7 +3355,7 @@ def ulcer_index(equity_series: pd.Series) -> float:
     return float(np.sqrt(np.mean(dd ** 2)) * 100)  # %
 
 
-def ulcer_performance_index(equity_series: pd.Series, rfr: float = 0.04) -> float:
+def ulcer_performance_index(equity_series: pd.Series, rfr: float = DEFAULT_RFR) -> float:
     """(CAGR - rfr) / Ulcer Index. Sharpe-like but uses Ulcer not vol."""
     if len(equity_series) < 2:
         return 0.0
@@ -3348,7 +3376,7 @@ def recovery_factor(total_return: float, max_dd: float) -> float:
     return float(total_return / abs(max_dd))
 
 
-def smart_sharpe(daily_returns: pd.Series, rfr: float = 0.04,
+def smart_sharpe(daily_returns: pd.Series, rfr: float = DEFAULT_RFR,
                  periods: int = 365) -> float:
     """Sharpe penalized by 1-lag autocorrelation. Smooth-return strategies
     (often a backtest artifact) get downweighted."""
@@ -3378,7 +3406,7 @@ def kelly_criterion(daily_returns: pd.Series) -> float:
 
 
 def beta_alpha_correlation(returns: pd.Series, bench_returns: pd.Series,
-                            rfr: float = 0.04) -> Tuple[float, float, float]:
+                            rfr: float = DEFAULT_RFR) -> Tuple[float, float, float]:
     """Returns (beta, annualized alpha, correlation) vs benchmark."""
     if len(returns) < 2 or len(bench_returns) < 2:
         return 0.0, 0.0, 0.0
@@ -3390,9 +3418,9 @@ def beta_alpha_correlation(returns: pd.Series, bench_returns: pd.Series,
     if var_b == 0:
         return 0.0, 0.0, 0.0
     beta_val = float(aligned['r'].cov(aligned['b']) / var_b)
-    rf_d = rfr / 365.0
+    rf_d = rfr / TRADING_DAYS_PER_YEAR
     alpha_daily = (aligned['r'].mean() - rf_d) - beta_val * (aligned['b'].mean() - rf_d)
-    alpha_ann = float(alpha_daily * 365)
+    alpha_ann = float(alpha_daily * TRADING_DAYS_PER_YEAR)
     corr = float(aligned['r'].corr(aligned['b']))
     return beta_val, alpha_ann, corr
 
@@ -3410,7 +3438,7 @@ def information_ratio(returns: pd.Series, bench_returns: pd.Series) -> float:
 
 
 def treynor_ratio(returns: pd.Series, bench_returns: pd.Series,
-                  rfr: float = 0.04) -> float:
+                  rfr: float = DEFAULT_RFR) -> float:
     """(Annualized return - rfr) / Beta. Like Sharpe but uses systematic risk."""
     beta_val, _, _ = beta_alpha_correlation(returns, bench_returns, rfr)
     if beta_val == 0:
@@ -3418,7 +3446,7 @@ def treynor_ratio(returns: pd.Series, bench_returns: pd.Series,
     aligned = pd.concat([returns, bench_returns], axis=1, join='inner').dropna()
     if len(aligned) < 2:
         return 0.0
-    annual_ret = float(aligned.iloc[:, 0].mean() * 365)
+    annual_ret = float(aligned.iloc[:, 0].mean() * TRADING_DAYS_PER_YEAR)
     return float((annual_ret - rfr) / beta_val)
 
 

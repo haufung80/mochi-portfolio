@@ -143,7 +143,7 @@ def render_live_drilldown(
     mc_dd_s = f"{ev['mc_dd_percentile']:.1f}%" if ev['mc_dd_percentile'] is not None else "n/a"
     mc_ret_s = f"{ev['mc_return_percentile']:.1f}%" if ev['mc_return_percentile'] is not None else "n/a"
     live_trades_n = ev.get('live_trades', ev['live_metrics']['n_active_days'])
-    min_trades_n = ev.get('min_live_trades', 20)
+    min_trades_n = ev.get('min_live_trades', calculations.MIN_LIVE_TRADES)
     trades_color = VERDICT_COLORS['keep'] if live_trades_n >= min_trades_n else VERDICT_COLORS['incubating']
     edge_dx = ev.get('edge_diagnosis', '⏳ n/a')
     edge_col = ev.get('edge_diagnosis_color', VERDICT_COLORS['incubating'])
@@ -464,7 +464,7 @@ def render_live_drilldown(
 
     # ── LIVE TRADE LOG (verify trade count + inspect exits) ────────────────
     st.divider()
-    st.markdown(f"###### 📋 Live Trade Log — verify trade count ({ev.get('live_trades', 0)}/{ev.get('min_live_trades', 20)})")
+    st.markdown(f"###### 📋 Live Trade Log — verify trade count ({ev.get('live_trades', 0)}/{ev.get('min_live_trades', calculations.MIN_LIVE_TRADES)})")
     try:
         csv_path = Path(portfolio_folder) / f"{sel_strat}.csv"
         raw_df = pd.read_csv(csv_path)
@@ -488,7 +488,7 @@ def render_live_drilldown(
         n_wins = int((live_exits['Net P&L USDT'] > 0).sum())
         n_losses = int((live_exits['Net P&L USDT'] < 0).sum())
         win_rate = (n_wins / n_trades * 100) if n_trades else 0
-        gate_status = ('✅ Meets ≥20 floor' if n_trades >= ev.get('min_live_trades', 20)
+        gate_status = (f'✅ Meets ≥{calculations.MIN_LIVE_TRADES} floor' if n_trades >= ev.get('min_live_trades', calculations.MIN_LIVE_TRADES)
                        else f'⏳ Below {ev.get("min_live_trades", 20)} — incubating')
         st.caption(
             f"**{n_trades} live exits** since {split_date.date()} · "
@@ -576,26 +576,31 @@ def render_vt_recompute_section(
     next render uses the fresh vt regardless.
     """
     vt1, vt2, vt3, vt4, vt5 = st.columns([1, 1, 1, 1, 1.3])
+    # Slider defaults read from calculations.VT_DEFAULT_* (single source).
     with vt1:
         vt_target_ror = st.slider(
-            "Per-strategy target RoR (%)", 1, 30, 10, step=1,
+            "Per-strategy target RoR (%)", 1, 30,
+            int(calculations.VT_DEFAULT_TARGET_ROR * 100), step=1,
             help="MC finds the max leverage where simulated Risk of Ruin ≤ this.",
         ) / 100.0
     with vt2:
         vt_max_loss = st.slider(
-            "Ruin: max loss (%)", 10, 80, 40, step=5,
+            "Ruin: max loss (%)", 10, 80,
+            int((1 - calculations.VT_DEFAULT_RUIN_FRAC) * 100), step=5,
             help="A strategy 'ruins' when equity drops by this from start. e.g. 40% = ruin at -40% of capital.",
         )
         vt_ruin_frac = (100.0 - vt_max_loss) / 100.0
     with vt3:
         vt_max_lev_strat = st.slider(
-            "Max strategy leverage", 0.5, 10.0, 1.0, step=0.5,
+            "Max strategy leverage", 0.5, 10.0,
+            float(calculations.VT_DEFAULT_MAX_LEV), step=0.5,
             key="vt_max_lev_strat",
             help="Cap on per-strategy leverage from MC binary search. Default 1x (no margin per strategy) — keeps post-scale RoR more contained after portfolio leveraging.",
         )
     with vt4:
         vt_port_target = st.slider(
-            "Portfolio vol target (%)", 5, 40, 20, step=1,
+            "Portfolio vol target (%)", 5, 40,
+            int(calculations.VT_DEFAULT_PORT_VOL * 100), step=1,
             help="Whole portfolio leveraged uniformly to hit this vol.",
         ) / 100.0
     with vt5:
@@ -1048,17 +1053,19 @@ with st.sidebar:
                                 help="Set to today's date (or the most-recent data day) to include live incubation in the analysis.")
         live_start = st.text_input(
             "Live incubation start (YYYY-MM-DD)",
-            value="2025-12-03",
+            value=calculations.LIVE_START_DEFAULT,
             help="Split date between in-sample backtest and out-of-sample live trading. Used by the Live Monitoring tab.",
         )
 
     with st.expander("💰 Risk Parameters", expanded=False):
         risk_free_rate = st.number_input(
-            "Risk-free rate (annual %)", value=4.0, min_value=0.0, max_value=20.0,
+            "Risk-free rate (annual %)",
+            value=float(calculations.DEFAULT_RFR * 100), min_value=0.0, max_value=20.0,
             help="Used in Sharpe / Sortino calculations",
         ) / 100.0
         total_cap = st.number_input(
-            "Total portfolio capital ($)", value=2000.0, min_value=100.0,
+            "Total portfolio capital ($)",
+            value=float(calculations.DEFAULT_CAPITAL), min_value=100.0,
             help="Capital is split equally across all strategies (default)",
         )
 
@@ -1087,22 +1094,30 @@ with st.sidebar:
             "Trades per year (portfolio MC)", value=365, min_value=10,
             help="Portfolio-level MC samples daily P&L = 365/yr. Per-strategy MC in MC+Vol Targeting uses each strategy's actual rate.",
         )
-        mc_n_runs = st.number_input("Number of runs", value=5000, min_value=100, step=500)
+        # All MC defaults read from calculations constants → the sidebar, the
+        # per-strategy kill-rule MC, and the portfolio envelope bootstrap
+        # IDENTICALLY (one source). Previously the sidebar defaulted to 5000
+        # runs / block 30 while the functions defaulted to 1000 / 5.
+        mc_n_runs = st.number_input(
+            "Number of runs", value=int(calculations.MC_DEFAULT_RUNS), min_value=100, step=500)
         mc_block_len = st.number_input(
-            "Block length (days)", value=30, min_value=1,
+            "Block length (days)", value=int(calculations.MC_DEFAULT_BLOCK_LEN), min_value=1,
             help="Block bootstrap preserves serial dependence",
         )
-        mc_seed = st.number_input("RNG seed (0 = random)", value=42, min_value=0)
+        mc_seed = st.number_input(
+            "RNG seed (0 = random)", value=int(calculations.MC_DEFAULT_SEED), min_value=0)
         st.caption("ℹ️ Portfolio MC start/ruin are auto-set from your total capital and the 40% ruin threshold.")
 
     with st.expander("🌊 Regime Classification", expanded=False):
-        # Defaults tuned for risk-management decisions (stable regime labels,
-        # not trading signals). 60d lookback + ±10% threshold cuts regime flips
-        # by ~50% vs the noisy 30d/±5% defaults — gives sustained Bull/Bear
-        # labels that are meaningful for "long-only in bear" headwind detection.
-        regime_lookback = st.number_input("Lookback (days)", value=60, min_value=5)
-        regime_bull_thr = st.number_input("Bull threshold (%)", value=10.0, step=0.5) / 100.0
-        regime_bear_thr = st.number_input("Bear threshold (%)", value=-10.0, step=0.5) / 100.0
+        # Defaults read from calculations.REGIME_DEFAULT_* (single source). 60d
+        # lookback + ±10% bands cut regime flips ~50% vs noisy 30d/±5% — stable
+        # labels for "long-only in bear" headwind detection.
+        regime_lookback = st.number_input(
+            "Lookback (days)", value=int(calculations.REGIME_DEFAULT_LOOKBACK), min_value=5)
+        regime_bull_thr = st.number_input(
+            "Bull threshold (%)", value=float(calculations.REGIME_DEFAULT_BULL_THR * 100), step=0.5) / 100.0
+        regime_bear_thr = st.number_input(
+            "Bear threshold (%)", value=float(calculations.REGIME_DEFAULT_BEAR_THR * 100), step=0.5) / 100.0
 
     with st.expander("🔬 Selection Bias", expanded=False):
         n_strategies_tested = st.number_input(
@@ -1170,12 +1185,13 @@ applies_cost = (cost_bps_rt + slippage_bps + abs(funding_bps)) > 0
 # AUTO-COMPUTE MC + VOL TARGETING (default sizing, used everywhere)
 # ============================================================================
 
-# Defaults for auto-compute. User can override in Monte Carlo & Sizing tab.
-VT_DEFAULT_TARGET_ROR = 0.10
-VT_DEFAULT_RUIN_FRAC = 0.60   # = 40% max loss
-VT_DEFAULT_MAX_LEV = 1.0      # no per-strategy margin by default
-VT_DEFAULT_PORT_VOL = 0.20    # 20% annualized portfolio vol
-VT_DEFAULT_N_RUNS = 1000
+# Defaults for auto-compute — single-sourced from calculations constants so the
+# sidebar, the auto-compute, and the calc-side signatures can never drift apart.
+VT_DEFAULT_TARGET_ROR = calculations.VT_DEFAULT_TARGET_ROR
+VT_DEFAULT_RUIN_FRAC = calculations.VT_DEFAULT_RUIN_FRAC
+VT_DEFAULT_MAX_LEV = calculations.VT_DEFAULT_MAX_LEV
+VT_DEFAULT_PORT_VOL = calculations.VT_DEFAULT_PORT_VOL
+VT_DEFAULT_N_RUNS = calculations.VT_DEFAULT_N_RUNS
 
 
 def auto_compute_vt():
