@@ -16,6 +16,17 @@ import calculations as C
 class TestConstantsExist:
     """All canonical constants are defined and have sane types."""
 
+    def test_mc_defaults_are_data_driven_optima(self):
+        """Lock the measured-optimal MC params so they don't drift back.
+
+        RUNS≥2000: below this the kill-%ile sampling noise (±0.63 at 1000 runs)
+        is large enough to flip borderline strategies across the 5% threshold;
+        at 2000 it collapses to ±0.22. BLOCK_LEN≈10: Politis-White n^(1/3)
+        optimum for ~1300 active daily obs (near-IID P&L, lag-1 ACF≈+0.13).
+        """
+        assert C.MC_DEFAULT_RUNS >= 2000, "kill-%ile unstable below 2000 runs"
+        assert 8 <= C.MC_DEFAULT_BLOCK_LEN <= 12, "block should be ~n^(1/3)≈10"
+
     def test_all_constants_present(self):
         for name in [
             'DEFAULT_COST_BPS_RT', 'DEFAULT_SLIPPAGE_BPS', 'DEFAULT_FUNDING_BPS_PER_DAY',
