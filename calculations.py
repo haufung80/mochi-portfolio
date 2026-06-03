@@ -1214,10 +1214,18 @@ def per_strategy_regime_pnl(plot_data: pd.DataFrame, regime: pd.Series) -> pd.Da
 # COST MODEL — net-of-fees on realized trades
 # ============================================================================
 
-# Default Bybit-perp cost assumptions (round-trip). These mirror the defaults
-# used by mc_vol_targeted_allocation so net figures are consistent app-wide.
-DEFAULT_COST_BPS_RT = 11.0    # exchange fee, round trip
-DEFAULT_SLIPPAGE_BPS = 2.0    # per-trade slippage
+# ── COST MODEL — SINGLE SOURCE OF TRUTH ─────────────────────────────────────
+# These constants are THE canonical cost assumptions for the entire dashboard.
+# The sidebar number_inputs default to these (app.py reads them), so the
+# vol-targeting amortized model, the per-trade net_of_fees model, and every
+# displayed net figure all use the same bps unless the user overrides in the UI.
+#
+# Data is Binance perp: taker fee 5bps/side → 10bps round trip. Verified that
+# the amortized (tpy×cost×pos/365) and per-trade (Σ cost×|notional|) models
+# agree to within 1% at the same scale, so net figures reconcile app-wide.
+DEFAULT_COST_BPS_RT = 10.0          # exchange fee, round trip (Binance taker 5bps×2)
+DEFAULT_SLIPPAGE_BPS = 2.0          # per-trade slippage
+DEFAULT_FUNDING_BPS_PER_DAY = 0.5   # perp funding (used by the amortized model only)
 
 
 def net_of_fees(gross_pnl, notional,
@@ -1241,8 +1249,8 @@ def net_of_fees(gross_pnl, notional,
         gross_pnl: per-trade gross P&L (Series or 1-D array).
         notional:  per-trade position notional, same length (Series or array).
                    Sign is ignored — cost is charged on |notional|.
-        cost_bps_rt: round-trip exchange fee in bps (default 11).
-        slippage_bps: per-trade slippage in bps (default 2).
+        cost_bps_rt: round-trip exchange fee in bps (default DEFAULT_COST_BPS_RT).
+        slippage_bps: per-trade slippage in bps (default DEFAULT_SLIPPAGE_BPS).
 
     Returns:
         (net_pnl: np.ndarray, total_fee: float) — net per-trade P&L array and

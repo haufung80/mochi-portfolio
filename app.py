@@ -1063,16 +1063,22 @@ with st.sidebar:
         )
 
     with st.expander("💸 Cost Model", expanded=False):
+        # Defaults read from calculations constants = SINGLE SOURCE OF TRUTH.
+        # This guarantees the sidebar, the vol-targeting amortized model, and
+        # the per-trade net_of_fees model all start from the same bps.
         cost_bps_rt = st.number_input(
-            "Exchange fee (bps, round trip)", value=10.0, min_value=0.0, step=1.0,
+            "Exchange fee (bps, round trip)",
+            value=float(calculations.DEFAULT_COST_BPS_RT), min_value=0.0, step=1.0,
             help="Binance perp taker = 5bps × 2 entries/exits = ~10bps round trip",
         )
         slippage_bps = st.number_input(
-            "Slippage (bps, round trip)", value=2.0, min_value=0.0, step=0.5,
+            "Slippage (bps, round trip)",
+            value=float(calculations.DEFAULT_SLIPPAGE_BPS), min_value=0.0, step=0.5,
             help="Estimated market impact — typically 1-5bps for liquid pairs",
         )
         funding_bps = st.number_input(
-            "Daily funding cost (bps)", value=0.5, min_value=-10.0, step=0.1,
+            "Daily funding cost (bps)",
+            value=float(calculations.DEFAULT_FUNDING_BPS_PER_DAY), min_value=-10.0, step=0.1,
             help="Average daily funding paid (negative = received). Crypto perps ~ 0.5-1bps/day on average",
         )
 

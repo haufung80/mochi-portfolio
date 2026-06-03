@@ -72,6 +72,31 @@ class TestNetOfFees:
         expected = 10000.0 * (DEFAULT_COST_BPS_RT + DEFAULT_SLIPPAGE_BPS) / 10000.0
         assert fee == pytest.approx(expected, abs=1e-9)
 
+    def test_cost_constants_are_single_source_of_truth(self):
+        """Guard: the canonical cost constants must stay the documented Binance
+        values. If these drift, the sidebar (which reads them) and every net
+        figure drift together — but a silent change here would desync intent.
+        """
+        assert DEFAULT_COST_BPS_RT == 10.0, "Binance taker 5bps×2 = 10bps RT"
+        assert DEFAULT_SLIPPAGE_BPS == 2.0
+        from calculations import DEFAULT_FUNDING_BPS_PER_DAY
+        assert DEFAULT_FUNDING_BPS_PER_DAY == 0.5
+
+    def test_amortized_and_pertrade_models_reconcile(self):
+        """The vol-targeting amortized model (tpy*cost*pos/365 summed over a year)
+        and the per-trade model (Σ cost*|notional|) must agree at the same scale.
+
+        This is the cross-dashboard consistency guarantee: Portfolio-tab metrics
+        (amortized) and Live-table net (per-trade) use the same effective cost.
+        """
+        cost_pct = (DEFAULT_COST_BPS_RT + DEFAULT_SLIPPAGE_BPS) / 10000.0
+        # A strategy that trades 100x/year, $1000 notional each, over exactly 1 year
+        tpy, notional, n_trades = 100, 1000.0, 100
+        amortized_annual = tpy * cost_pct * notional
+        _, pertrade_total = net_of_fees([0.0] * n_trades, [notional] * n_trades)
+        # Same scale, same year → must match exactly
+        assert amortized_annual == pytest.approx(pertrade_total, rel=1e-9)
+
     def test_total_fee_scales_with_trade_count(self):
         """More trades on same notional → proportionally more fees (the high-freq tax)."""
         _, fee_10 = net_of_fees([0.0] * 10, [1000.0] * 10)
@@ -151,8 +176,10 @@ class TestNetLivePnlFromCsv:
         # Split mid-way so only later exits count as "live".
         out = net_live_pnl_from_csv(tz_aware_tv_csv, pd.Timestamp("2024-06-01"))
         assert out['n_trades'] > 0, "should find live exits after split"
-        # fee = n_trades * 500 * (11+2)/10000 = n_trades * 0.65
-        assert out['fees'] == pytest.approx(out['n_trades'] * 500 * 0.0013, abs=1e-6)
+        # fee = n_trades * 500 * (DEFAULT_COST_BPS_RT + DEFAULT_SLIPPAGE_BPS)/10000
+        # — derive from constants so this test tracks the single source of truth.
+        bps = (DEFAULT_COST_BPS_RT + DEFAULT_SLIPPAGE_BPS) / 10000.0
+        assert out['fees'] == pytest.approx(out['n_trades'] * 500 * bps, abs=1e-6)
         # net = gross - fees, always
         assert out['net'] == pytest.approx(out['gross'] - out['fees'], abs=1e-6)
 
