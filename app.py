@@ -619,44 +619,24 @@ def render_vt_recompute_section(
     )
 
     if vt_run_btn:
-        with st.spinner(f"Step 1: MC binary search for {len(plot_data.columns) - 5} strategies × 1000 runs each... then Step 2: portfolio vol scaling..."):
-            vt = mc_vol_targeted_allocation(
-                plot_data=plot_data,
-                metrics_df=metrics_df,
-                total_cap=total_cap,
-                target_ror=vt_target_ror,
-                ruin_fraction=vt_ruin_frac,
-                max_leverage_cap=vt_max_lev_strat,
-                target_portfolio_vol=vt_port_target,
-                n_runs=1000,
-                block_len=mc_block_len,
-                seed=mc_seed if mc_seed > 0 else None,
-                cost_bps_per_round_trip=cost_bps_rt if vt_apply_costs else 0.0,
-                slippage_bps=slippage_bps if vt_apply_costs else 0.0,
-                funding_bps_per_day=funding_bps if vt_apply_costs else 0.0,
-                normalize_backtest_pos=False,
-            )
-            st.session_state['vt_alloc'] = vt
-            # Persist the user's choice so the WHOLE app (Portfolio/Risk tabs via
-            # auto_compute_vt → vt_view) converges on it and it survives sidebar
-            # changes. Also force vt_data_fp stale so auto_compute_vt re-derives
-            # vt_view from these params on the next full rerun.
-            st.session_state['vt_user_params'] = dict(
-                target_ror=vt_target_ror, ruin_fraction=vt_ruin_frac,
-                max_leverage_cap=vt_max_lev_strat, target_portfolio_vol=vt_port_target,
-            )
-            for stale_key in (
-                'vt_data_fp',                                  # force vt_view re-derive
-                'mc_fp', 'mc_results', 'mc_start_used', 'mc_ruin_used',
-                'port_env_fp', 'port_env_df',
-            ):
-                st.session_state.pop(stale_key, None)
-            st.success(
-                f"✅ Vol-targeted to {vt_port_target:.0%} — metrics below are live. "
-                "The **Portfolio / Risk tabs** show this sizing after your next "
-                "interaction (e.g. switch tabs then touch any sidebar control) — "
-                "a Streamlit fragment limitation, not stale data."
-            )
+        # Persist the user's sizing choice, clear dependent caches, then force a
+        # FULL app rerun. auto_compute_vt (top of the rerun) does the single
+        # recompute from these params → vt_view + EVERY tab reflect it instantly.
+        # The radio-based nav preserves the active tab across the rerun, so the
+        # user stays right here (no bounce) — the reason this is finally safe.
+        st.session_state['vt_user_params'] = dict(
+            target_ror=vt_target_ror, ruin_fraction=vt_ruin_frac,
+            max_leverage_cap=vt_max_lev_strat, target_portfolio_vol=vt_port_target,
+            apply_costs=bool(vt_apply_costs),
+        )
+        for stale_key in (
+            'vt_data_fp',                                  # force vt_view re-derive
+            'mc_fp', 'mc_results', 'mc_start_used', 'mc_ruin_used',
+            'port_env_fp', 'port_env_df',
+        ):
+            st.session_state.pop(stale_key, None)
+        st.toast(f"✅ Vol-targeted to {vt_port_target:.0%} — all tabs updated", icon="✅")
+        st.rerun(scope="app")
 
     if 'vt_alloc' not in st.session_state:
         return
@@ -1229,15 +1209,18 @@ def auto_compute_vt():
     eff_ruin_frac = up.get('ruin_fraction', VT_DEFAULT_RUIN_FRAC)
     eff_max_lev = up.get('max_leverage_cap', VT_DEFAULT_MAX_LEV)
     eff_port_vol = up.get('target_portfolio_vol', VT_DEFAULT_PORT_VOL)
+    # Cost on/off follows the user's VT-section checkbox once they've run it,
+    # else the sidebar cost setting.
+    eff_apply_cost = up.get('apply_costs', applies_cost)
 
     # Data fingerprint — recompute when any input that AFFECTS the vol-targeting
     # changes. Includes the user's VT params + mc_block_len/mc_seed, so changing
     # any of them refreshes the Portfolio tab (was the stale-metrics bug).
     data_fp = (
         total_cap, float(risk_free_rate),
-        float(cost_bps_rt) if applies_cost else 0.0,
-        float(slippage_bps) if applies_cost else 0.0,
-        float(funding_bps) if applies_cost else 0.0,
+        float(cost_bps_rt) if eff_apply_cost else 0.0,
+        float(slippage_bps) if eff_apply_cost else 0.0,
+        float(funding_bps) if eff_apply_cost else 0.0,
         oos_start, oos_end, portfolio_folder,
         plot_data.shape, len(metrics_df),
         int(mc_block_len), int(mc_seed),
@@ -1260,9 +1243,9 @@ def auto_compute_vt():
             n_runs=VT_DEFAULT_N_RUNS,
             block_len=mc_block_len,
             seed=mc_seed if mc_seed > 0 else None,
-            cost_bps_per_round_trip=cost_bps_rt if applies_cost else 0.0,
-            slippage_bps=slippage_bps if applies_cost else 0.0,
-            funding_bps_per_day=funding_bps if applies_cost else 0.0,
+            cost_bps_per_round_trip=cost_bps_rt if eff_apply_cost else 0.0,
+            slippage_bps=slippage_bps if eff_apply_cost else 0.0,
+            funding_bps_per_day=funding_bps if eff_apply_cost else 0.0,
             normalize_backtest_pos=False,
         )
         st.session_state['vt_alloc'] = vt
@@ -1495,14 +1478,27 @@ st.divider()
 # MAIN TABS
 # ============================================================================
 
-tab_live, tab_port, tab_strat, tab_wf, tab_risk, tab_mc = st.tabs([
-    "📡 Live Monitoring",
-    "🎯 Portfolio",
-    "🔬 Strategies",
-    "🚶 Walk-Forward",
-    "🔥 Risk & Regime",
-    "🎲 Monte Carlo & Sizing",
-])
+# Session-state-backed tab navigation (replaces st.tabs).
+#
+# st.tabs resets to the first tab on every full rerun, which forced us into
+# @st.fragment workarounds and still left other tabs stale after a manual VT
+# recompute. A radio keyed in session_state PERSISTS the selection across
+# st.rerun(), so the manual recompute can force a full app rerun (updating ALL
+# tabs instantly) WITHOUT bouncing the user off their current tab. Bonus: only
+# the active tab's body executes per rerun (st.tabs ran all six), so each
+# interaction is faster.
+TAB_LIVE = "📡 Live Monitoring"
+TAB_PORT = "🎯 Portfolio"
+TAB_STRAT = "🔬 Strategies"
+TAB_WF = "🚶 Walk-Forward"
+TAB_RISK = "🔥 Risk & Regime"
+TAB_MC = "🎲 Monte Carlo & Sizing"
+active_tab = st.radio(
+    "Navigation",
+    [TAB_LIVE, TAB_PORT, TAB_STRAT, TAB_WF, TAB_RISK, TAB_MC],
+    horizontal=True, label_visibility="collapsed", key="active_tab",
+)
+st.divider()
 
 # ============================================================================
 # TAB: LIVE MONITORING
@@ -1512,7 +1508,7 @@ tab_live, tab_port, tab_strat, tab_wf, tab_risk, tab_mc = st.tabs([
 # compares per-strategy backtest vs live, runs statistical drift tests,
 # and classifies each strategy's health.
 
-with tab_live:
+if active_tab == TAB_LIVE:
     st.subheader("📡 Live Incubation Monitoring — Per-Strategy")
     st.caption(
         "Each strategy-ticker instance evaluated against its own backtest-derived "
@@ -1713,7 +1709,7 @@ with tab_live:
 # TAB: PORTFOLIO OVERVIEW
 # ============================================================================
 
-with tab_port:
+if active_tab == TAB_PORT:
     if plot_data is None or plot_data.empty:
         st.error("No portfolio data. Check sidebar configuration.")
     elif vt_view is None:
@@ -2112,7 +2108,7 @@ with tab_port:
 # TAB: STRATEGY BREAKDOWN
 # ============================================================================
 
-with tab_strat:
+if active_tab == TAB_STRAT:
     st.subheader("Per-Strategy Performance")
 
     if metrics_df is None or metrics_df.empty:
@@ -2280,7 +2276,7 @@ with tab_strat:
 # TAB: WALK-FORWARD
 # ============================================================================
 
-with tab_wf:
+if active_tab == TAB_WF:
     st.subheader("Walk-Forward Robustness (K-Fold OOS)")
     st.caption("""
     Splits each strategy's history into N equal-time folds and scores each independently.
@@ -2493,7 +2489,7 @@ with tab_wf:
 # TAB: RISK & REGIME
 # ============================================================================
 
-with tab_risk:
+if active_tab == TAB_RISK:
     if plot_data is None or plot_data.empty:
         st.error("No portfolio data.")
     else:
@@ -2898,7 +2894,7 @@ with tab_risk:
 # TAB: MONTE CARLO
 # ============================================================================
 
-with tab_mc:
+if active_tab == TAB_MC:
     st.subheader("Portfolio Forward-Risk Simulation (Vol-Targeted, Net of Costs)")
     st.caption("""
     Block-bootstrap MC on the **vol-targeted portfolio's daily P&L (net of costs when "Apply costs" is on)**
