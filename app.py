@@ -167,53 +167,71 @@ def render_live_drilldown(
         unsafe_allow_html=True,
     )
 
-    # ── CHART 1: Equity + Bootstrap Envelope (P5–P95 from MC) ───────────────
-    st.markdown("###### 📈 Equity Curve + Bootstrap Envelope (±2σ from MC)")
+    # ── MASTER CHART: Equity + MC envelope (left axis) vs ticker price (right) ──
+    # One comprehensive view: strategy equity (BT + live) against the MC-predicted
+    # envelope, AND the traded ticker's price on a secondary axis — so you can see
+    # at a glance whether live under/over-performance lines up with the ticker's
+    # own move (regime). Replaces the former separate "Equity & MC envelope" and
+    # "Strategy P&L vs ticker price" charts, which both re-drew the equity curve.
+    st.markdown("###### 📈 Equity + MC Envelope vs Traded Ticker Price")
+    st.caption(
+        "Left axis: strategy equity ($) — backtest, the ±2σ MC envelope it was "
+        "*expected* to follow, and the live actual. Right axis: the traded "
+        f"**{ticker}** price (dotted) — to see if live moves track the underlying."
+    )
     mc = ev['mc']
     bt_pnl = ev['bt_pnl']; live_pnl = ev['live_pnl']
     combined_pnl = pd.concat([bt_pnl, live_pnl]).sort_index()
     combined_eq = combined_pnl.cumsum() + per_strat_cap
-
-    fig = go.Figure()
     bt_eq = combined_eq[combined_eq.index < split_date]
     live_eq = combined_eq[combined_eq.index >= split_date]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # --- Right axis FIRST (drawn underneath): traded ticker price ---
+    ticker_prices = fetch_ticker_prices(
+        ticker, str(combined_eq.index.min().date()), str(combined_eq.index.max().date()),
+    )
+    if not ticker_prices.empty:
+        fig.add_trace(go.Scatter(
+            x=ticker_prices.index, y=ticker_prices.values,
+            line=dict(color=VERDICT_COLORS['warn'], width=1.4, dash='dot'),
+            name=f'{ticker} price (${ticker_prices.iloc[-1]:,.0f})', opacity=0.6,
+            hovertemplate=f'{ticker} $%{{y:,.0f}}<extra></extra>',
+        ), secondary_y=True)
+
+    # --- Left axis: backtest equity ---
     fig.add_trace(go.Scatter(
         x=bt_eq.index, y=bt_eq.values,
         line=dict(color=VERDICT_COLORS['neutral'], width=1.8),
         name=f'Backtest (final ${bt_eq.iloc[-1]:,.0f})' if not bt_eq.empty else 'Backtest',
-    ))
+    ), secondary_y=False)
 
-    # Bootstrap envelope (P5–P95) — starts from BT end value, extends live_days forward
+    # --- Left axis: MC envelope (P5–P95, IQR, P50) projected from BT-end ---
     if mc['n_runs'] > 0 and not bt_eq.empty and not live_eq.empty:
         bt_end_val = float(bt_eq.iloc[-1])
         n_env = min(len(mc['p50_path']), len(live_eq))
         env_x = live_eq.index[:n_env]
-        p5 = bt_end_val + mc['p5_path'][:n_env]
-        p25 = bt_end_val + mc['p25_path'][:n_env]
-        p50 = bt_end_val + mc['p50_path'][:n_env]
-        p75 = bt_end_val + mc['p75_path'][:n_env]
+        p5 = bt_end_val + mc['p5_path'][:n_env]; p25 = bt_end_val + mc['p25_path'][:n_env]
+        p50 = bt_end_val + mc['p50_path'][:n_env]; p75 = bt_end_val + mc['p75_path'][:n_env]
         p95 = bt_end_val + mc['p95_path'][:n_env]
-        fig.add_trace(go.Scatter(x=env_x, y=p95, line=dict(width=0), showlegend=False, hoverinfo='skip'))
+        fig.add_trace(go.Scatter(x=env_x, y=p95, line=dict(width=0), showlegend=False, hoverinfo='skip'), secondary_y=False)
         fig.add_trace(go.Scatter(
-            x=env_x, y=p5, line=dict(width=0),
-            fill='tonexty', fillcolor='rgba(149,165,166,0.18)',
-            name='MC P5–P95 (±2σ)',
-            hovertemplate='P5 $%{y:,.0f}<extra></extra>',
-        ))
-        fig.add_trace(go.Scatter(x=env_x, y=p75, line=dict(width=0), showlegend=False, hoverinfo='skip'))
+            x=env_x, y=p5, line=dict(width=0), fill='tonexty', fillcolor='rgba(149,165,166,0.18)',
+            name='MC P5–P95 (±2σ)', hovertemplate='P5 $%{y:,.0f}<extra></extra>',
+        ), secondary_y=False)
+        fig.add_trace(go.Scatter(x=env_x, y=p75, line=dict(width=0), showlegend=False, hoverinfo='skip'), secondary_y=False)
         fig.add_trace(go.Scatter(
-            x=env_x, y=p25, line=dict(width=0),
-            fill='tonexty', fillcolor='rgba(149,165,166,0.32)',
-            name='MC P25–P75 (IQR)',
-            hovertemplate='P25 $%{y:,.0f}<extra></extra>',
-        ))
+            x=env_x, y=p25, line=dict(width=0), fill='tonexty', fillcolor='rgba(149,165,166,0.32)',
+            name='MC P25–P75 (IQR)', hovertemplate='P25 $%{y:,.0f}<extra></extra>',
+        ), secondary_y=False)
         fig.add_trace(go.Scatter(
             x=env_x, y=p50, mode='lines',
             line=dict(color=VERDICT_COLORS['neutral'], width=1.5, dash='dot'),
             name=f'MC P50 (expected ${p50[-1]:,.0f})',
-        ))
+        ), secondary_y=False)
 
-    # Live actual overlay + Live% / Live MDD% annotations
+    # --- Left axis: live actual + Live% / MDD annotations + MDD markers ---
     if not live_eq.empty:
         stitch_x = [bt_eq.index[-1]] + list(live_eq.index) if not bt_eq.empty else list(live_eq.index)
         stitch_y = ([float(bt_eq.iloc[-1])] if not bt_eq.empty else []) + list(live_eq.values)
@@ -221,66 +239,51 @@ def render_live_drilldown(
             x=stitch_x, y=stitch_y, mode='lines',
             line=dict(color=verdict_color, width=2.8),
             name=f'Live actual (final ${live_eq.iloc[-1]:,.0f})',
-        ))
-        # Live Return % annotation (end-of-live label)
+        ), secondary_y=False)
         fig.add_annotation(
             x=live_eq.index[-1], y=float(live_eq.iloc[-1]),
             text=f"<b>Live: {live_pct:+.2f}%</b>",
-            showarrow=True, arrowhead=2, arrowsize=1,
-            arrowcolor=verdict_color, arrowwidth=1.5,
-            ax=40, ay=-30,
-            bgcolor='rgba(255,255,255,0.95)',
+            showarrow=True, arrowhead=2, arrowsize=1, arrowcolor=verdict_color, arrowwidth=1.5,
+            ax=40, ay=-30, bgcolor='rgba(255,255,255,0.95)',
             bordercolor=verdict_color, borderwidth=1, borderpad=4,
             font=dict(color=verdict_color, size=11),
         )
-        # Live MDD: peak/trough markers + dashed span + label
         le_vals = live_eq.values.astype(float)
         if len(le_vals) >= 2:
             running_max = np.maximum.accumulate(le_vals)
-            dd_pct_arr = (le_vals - running_max) / running_max
-            trough_pos = int(np.argmin(dd_pct_arr))
+            trough_pos = int(np.argmin((le_vals - running_max) / running_max))
             if trough_pos > 0:
                 peak_pos = int(np.argmax(le_vals[:trough_pos + 1]))
-                peak_date = live_eq.index[peak_pos]
-                trough_date = live_eq.index[trough_pos]
-                peak_val = float(le_vals[peak_pos])
-                trough_val = float(le_vals[trough_pos])
+                peak_date = live_eq.index[peak_pos]; trough_date = live_eq.index[trough_pos]
+                peak_val = float(le_vals[peak_pos]); trough_val = float(le_vals[trough_pos])
                 live_mdd_pct = (trough_val - peak_val) / peak_val * 100
                 fig.add_trace(go.Scatter(
                     x=[peak_date], y=[peak_val], mode='markers',
-                    marker=dict(symbol='triangle-down', size=12, color='#2c3e50',
-                                line=dict(color='white', width=1)),
-                    name='MDD peak', showlegend=False,
-                    hovertemplate=f'Peak ${peak_val:,.2f}<extra></extra>',
-                ))
+                    marker=dict(symbol='triangle-down', size=12, color='#2c3e50', line=dict(color='white', width=1)),
+                    name='MDD peak', showlegend=False, hovertemplate=f'Peak ${peak_val:,.2f}<extra></extra>',
+                ), secondary_y=False)
                 fig.add_trace(go.Scatter(
                     x=[trough_date], y=[trough_val], mode='markers',
-                    marker=dict(symbol='triangle-up', size=12, color=VERDICT_COLORS['kill'],
-                                line=dict(color='white', width=1)),
-                    name='MDD trough', showlegend=False,
-                    hovertemplate=f'Trough ${trough_val:,.2f}<extra></extra>',
-                ))
-                fig.add_shape(
-                    type='line',
-                    x0=peak_date, x1=trough_date,
-                    y0=peak_val, y1=trough_val,
-                    line=dict(color=VERDICT_COLORS['kill'], width=1.4, dash='dash'),
-                )
+                    marker=dict(symbol='triangle-up', size=12, color=VERDICT_COLORS['kill'], line=dict(color='white', width=1)),
+                    name='MDD trough', showlegend=False, hovertemplate=f'Trough ${trough_val:,.2f}<extra></extra>',
+                ), secondary_y=False)
+                fig.add_shape(type='line', x0=peak_date, x1=trough_date, y0=peak_val, y1=trough_val,
+                              line=dict(color=VERDICT_COLORS['kill'], width=1.4, dash='dash'))
                 fig.add_annotation(
                     x=trough_date, y=trough_val,
                     text=f"<b>Live MDD: {live_mdd_pct:.2f}%</b>",
-                    showarrow=True, arrowhead=2, arrowsize=1,
-                    arrowcolor=VERDICT_COLORS['kill'], arrowwidth=1.5,
-                    ax=-40, ay=35,
-                    bgcolor='rgba(255,255,255,0.95)',
+                    showarrow=True, arrowhead=2, arrowsize=1, arrowcolor=VERDICT_COLORS['kill'], arrowwidth=1.5,
+                    ax=-40, ay=35, bgcolor='rgba(255,255,255,0.95)',
                     bordercolor=VERDICT_COLORS['kill'], borderwidth=1, borderpad=4,
                     font=dict(color=VERDICT_COLORS['kill'], size=11),
                 )
     mark_live_start(fig, split_date)
+    fig.update_xaxes(title_text="Date")
+    fig.update_yaxes(title_text="Strategy Equity ($)", secondary_y=False)
+    fig.update_yaxes(title_text=f"{ticker} Price ($)", secondary_y=True, showgrid=False)
     fig.update_layout(
-        title=f"Equity & MC envelope — {extract_family(sel_strat)} {ticker}",
-        xaxis_title="Date", yaxis_title="Equity ($)",
-        hovermode='x', height=440,
+        title=f"{extract_family(sel_strat)} {ticker} — equity vs MC envelope vs price",
+        hovermode='x', height=480,
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -365,41 +368,6 @@ def render_live_drilldown(
             height=360, hovermode='x', showlegend=False,
         )
         st.plotly_chart(fig, use_container_width=True)
-
-    # ── CHART 4: Strategy Equity vs Ticker Price (dual Y-axis) ─────────────
-    st.markdown("###### 🪙 Strategy Equity vs Traded Ticker Price")
-    ticker_prices = fetch_ticker_prices(
-        ticker, str(plot_data.index.min().date()), str(plot_data.index.max().date()),
-    )
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(
-        go.Scatter(
-            x=combined_eq.index, y=combined_eq.values,
-            line=dict(color=verdict_color, width=2.2),
-            name=f'Strategy equity (${combined_eq.iloc[-1]:,.0f})',
-        ),
-        secondary_y=False,
-    )
-    if not ticker_prices.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=ticker_prices.index, y=ticker_prices.values,
-                line=dict(color=VERDICT_COLORS['warn'], width=1.5, dash='dot'),
-                name=f'{ticker} price (${ticker_prices.iloc[-1]:,.0f})',
-                opacity=0.7,
-            ),
-            secondary_y=True,
-        )
-    mark_live_start(fig, split_date, label=f"📡 Live starts {split_date.strftime('%Y-%m-%d')}")
-    fig.update_xaxes(title_text="Date")
-    fig.update_yaxes(title_text="Strategy Equity ($)", secondary_y=False)
-    fig.update_yaxes(title_text=f"{ticker} Price ($)", secondary_y=True, showgrid=False)
-    fig.update_layout(
-        title=f"Strategy P&L vs underlying {ticker} price action",
-        height=400, hovermode='x',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-    )
-    st.plotly_chart(fig, use_container_width=True)
 
     # ── MC DISTRIBUTION HISTOGRAMS (audit MC %ile correctness) ──────────────
     st.divider()
