@@ -4,7 +4,6 @@ Comprehensive backtest analytics + walk-forward + costs + regimes + sizing.
 """
 
 import math
-import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -629,7 +628,7 @@ def render_vt_recompute_section(
     sm2.metric(
         "🎯 Portfolio Leverage (uniform)",
         f"{vt['portfolio_scale']:.2f}x",
-        delta=f"applied to ALL positions",
+        delta="applied to ALL positions",
         delta_color="off",
         help="Single multiplier applied to every strategy's per-strategy-vol position to scale the entire portfolio to the portfolio vol target. Same number for all strategies.",
     )
@@ -893,7 +892,7 @@ def render_vt_recompute_section(
     avg_lev = total_notional / total_margin if total_margin > 0 else 0
     dep_c1, dep_c2, dep_c3 = st.columns(3)
     dep_c1.metric("Total Margin Used", f"${total_margin:,.0f}",
-                  delta=f"= total portfolio capital")
+                  delta="= total portfolio capital")
     dep_c2.metric("Total Notional Traded", f"${total_notional:,.0f}",
                   delta=f"{avg_lev:.2f}x avg portfolio leverage")
     dep_c3.metric("Target Portfolio Vol", f"{vt['portfolio_vol']:.1%}",
@@ -990,11 +989,9 @@ st.title("📊 Mochi Protocol — Portfolio Analytics")
 st.caption("Backtest analytics · Walk-forward robustness · Cost-net performance · Regime conditional")
 
 # Columns in plot_data that are NOT individual strategies — used to extract
-# strategy columns by exclusion. Centralized so every tab uses the same set.
-PORTFOLIO_RESERVED_COLS = frozenset({
-    'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-    'B&H BTC Equity', 'Portfolio Load',
-})
+# strategy columns by exclusion. SINGLE SOURCE: sourced from calculations so the
+# app, the engine's internal filters, and the tests can never desync.
+PORTFOLIO_RESERVED_COLS = calculations.PORTFOLIO_RESERVED_COLS
 
 # ============================================================================
 # SIDEBAR CONFIG

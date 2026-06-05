@@ -147,6 +147,41 @@ VERDICT_COLORS = {
     'axis':       '#34495e',   # dark grey — axes / reference lines
 }
 
+# Portfolio-level columns that process_portfolio appends to plot_data — every
+# other column is a strategy. SINGLE SOURCE OF TRUTH: all strategy-column filters
+# (here and in app.py) reference this, so adding a portfolio column can never
+# desync the filters or let a conservation/aggregation step miscount.
+PORTFOLIO_RESERVED_COLS = frozenset({
+    'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
+    'B&H BTC Equity', 'Portfolio Load',
+})
+
+
+# ============================================================================
+# NUMERIC SAFETY — std/var that degrade to 0.0 instead of NaN on tiny samples
+# ============================================================================
+# pandas/numpy .std()/.var() use ddof=1, so a SINGLE observation returns NaN.
+# A bare `std() == 0` guard then sees `NaN == 0` → False and lets NaN poison
+# Sharpe / Sortino / Kelly / diversification. These helpers centralize the
+# len≥2 + finiteness guard so every stats path shares ONE seam.
+
+def safe_std(series, ddof: int = 1) -> float:
+    """Sample std (ddof=1) that returns 0.0 for <2 obs or a non-finite result."""
+    s = pd.Series(series)
+    if len(s) < 2:
+        return 0.0
+    v = float(s.std(ddof=ddof))
+    return v if np.isfinite(v) else 0.0
+
+
+def safe_var(series, ddof: int = 1) -> float:
+    """Sample variance (ddof=1) that returns 0.0 for <2 obs or non-finite."""
+    s = pd.Series(series)
+    if len(s) < 2:
+        return 0.0
+    v = float(s.var(ddof=ddof))
+    return v if np.isfinite(v) else 0.0
+
 
 def _normalize_tv_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Rename new-format TradingView columns to canonical names. Idempotent."""
@@ -309,18 +344,19 @@ def get_max_duration(dates: pd.Series, dd_series: pd.Series) -> int:
 
 
 def get_risk_ratios(daily_returns: pd.Series, risk_free_annual: float) -> Tuple[float, float]:
-    """Annualized Sharpe and Sortino."""
-    # Need ≥2 observations: pandas .std() uses ddof=1, so a SINGLE data point
-    # returns NaN (not 0). A bare `std() == 0` guard evaluates `NaN == 0` → False,
-    # letting NaN poison Sharpe/Sortino. Guard on length + finiteness explicitly.
-    std = daily_returns.std() if len(daily_returns) >= 2 else 0.0
-    if daily_returns.empty or not np.isfinite(std) or std == 0:
+    """Annualized Sharpe and Sortino (both use ddof=1 / N-1 normalization)."""
+    std = safe_std(daily_returns)  # 0.0 for <2 obs or non-finite → avoids NaN poisoning
+    if std == 0:
         return 0.0, 0.0
     rf_daily = risk_free_annual / TRADING_DAYS_PER_YEAR
     excess = daily_returns - rf_daily
     sharpe = float((excess.mean() / std) * ANNUALIZATION_FACTOR)
+    # Downside deviation with the SAME ddof=1 (÷ N-1) convention as the Sharpe
+    # denominator above. Was np.mean (÷ N), which made Sortino inconsistent with
+    # Sharpe on small samples (Sortino systematically inflated vs Sharpe).
+    n = len(excess)
     downside = np.minimum(0, excess)
-    downside_dev = np.sqrt(np.mean(downside ** 2))
+    downside_dev = float(np.sqrt((downside ** 2).sum() / (n - 1))) if n >= 2 else 0.0
     sortino = float((excess.mean() / downside_dev) * ANNUALIZATION_FACTOR) if downside_dev > 0 else 0.0
     return sharpe, sortino
 
@@ -359,9 +395,11 @@ def get_signed_position_series(df: pd.DataFrame) -> pd.Series:
 
 def get_div_ratio(all_daily_pnl: pd.DataFrame, port_daily_pnl: pd.Series) -> float:
     """Diversification ratio: sum of per-strategy stds / portfolio std."""
-    indiv = all_daily_pnl.std().sum()
-    port = port_daily_pnl.std()
-    return float(indiv / port) if port > 0 else 1.0
+    port = safe_std(port_daily_pnl)  # 0.0 for <2 obs — avoids the NaN>0=False trap
+    if port <= 0:
+        return 1.0
+    indiv = float(all_daily_pnl.std().sum())  # ≥2 obs here, so per-column std is defined
+    return indiv / port
 
 
 def get_mdd_info(equity_series: pd.Series, starting_capital: float,
@@ -423,10 +461,19 @@ def get_yearly_returns(equity_series: pd.Series) -> pd.Series:
 
 def rolling_sharpe(daily_returns: pd.Series, window: int = 30,
                    risk_free_annual: float = DEFAULT_RFR) -> pd.Series:
-    """Rolling annualized Sharpe."""
+    """Rolling annualized Sharpe.
+
+    Returns an all-NaN series (plotted as a gap) when there are fewer than
+    `window` observations, and maps a zero-vol window's std to NaN so a constant
+    window yields a gap rather than +inf flowing into the chart — guarding the
+    same ddof=1 path hardened in get_risk_ratios (cf. rolling_calmar's guard).
+    """
+    if daily_returns is None or len(daily_returns) < window:
+        return pd.Series(np.nan, index=getattr(daily_returns, 'index', None), dtype=float)
     rf_daily = risk_free_annual / TRADING_DAYS_PER_YEAR
     excess = daily_returns - rf_daily
-    return (excess.rolling(window).mean() / daily_returns.rolling(window).std()) * ANNUALIZATION_FACTOR
+    roll_std = daily_returns.rolling(window).std().replace(0.0, np.nan)
+    return (excess.rolling(window).mean() / roll_std) * ANNUALIZATION_FACTOR
 
 
 def rolling_calmar(daily_pnl: pd.Series, starting_capital: float,
@@ -847,7 +894,7 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
         2. Pre-scale position $ = MC_leverage × equal_cap (per strategy)
         3. Aggregate to portfolio; measure realized portfolio annualized vol
         4. Uniform portfolio_scale = target_portfolio_vol / realized_vol
-        5. Final position $ = pre × portfolio_scale  (capped at max_leverage_cap)
+        5. Final position $ = pre × portfolio_scale  (portfolio_scale is NOT capped)
         6. Verify post-scale RoR per strategy (returns full MC distributions)
 
     Args:
@@ -856,7 +903,9 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
         total_cap: total starting capital
         target_ror: max acceptable per-strategy risk of ruin (default 10%)
         ruin_fraction: ruin = drawdown ≥ this fraction of starting cap (default 60%)
-        max_leverage_cap: hard ceiling on portfolio_scale (default 1.0)
+        max_leverage_cap: per-strategy leverage-search ceiling used in Step 1
+            (bounds each strategy's safe_leverage); it is NOT a cap on the
+            portfolio_scale applied in Step 5. (default 1.0)
         target_portfolio_vol: target annualized portfolio volatility (default 20%)
         n_runs: MC simulations per leverage search step (default 1000)
         block_len: block-bootstrap block length (default 5)
@@ -876,8 +925,7 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
           • mc_distributions: MC return / DD samples for each strategy (post-scale)
           • realized_vol / portfolio_scale / max_load: diagnostic metadata
     """
-    ignore = {'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-              'B&H BTC Equity', 'Portfolio Load'}
+    ignore = PORTFOLIO_RESERVED_COLS
     strategy_cols = [c for c in plot_data.columns if c not in ignore]
     n = max(len(strategy_cols), 1)
     equal_cap = total_cap / n
@@ -1147,8 +1195,7 @@ def walk_forward_analysis(plot_data: pd.DataFrame, capital: float, rfr: float,
     equal-weight backtest. Per-strategy fold metrics still use ``plot_data``
     columns (raw P&L per strategy).
     """
-    ignore = {'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-              'B&H BTC Equity', 'Portfolio Load'}
+    ignore = PORTFOLIO_RESERVED_COLS
     strategy_cols = [c for c in plot_data.columns if c not in ignore]
     if not strategy_cols or plot_data.empty:
         return {'folds': [], 'strategies': {}, 'portfolio': []}
@@ -1291,8 +1338,7 @@ def regime_segments(regime: pd.Series) -> List[Tuple[str, pd.Timestamp, pd.Times
 
 def per_strategy_regime_pnl(plot_data: pd.DataFrame, regime: pd.Series) -> pd.DataFrame:
     """Total P&L by strategy × regime."""
-    ignore = {'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-              'B&H BTC Equity', 'Portfolio Load'}
+    ignore = PORTFOLIO_RESERVED_COLS
     strategy_cols = [c for c in plot_data.columns if c not in ignore]
     if not strategy_cols or regime.empty:
         return pd.DataFrame()
@@ -1342,10 +1388,13 @@ def net_of_fees(gross_pnl, notional,
     n = np.abs(np.asarray(notional, dtype=float))
     if g.shape != n.shape:
         raise ValueError(f"length mismatch: {g.shape} gross_pnl vs {n.shape} notional")
-    if g.size == 0:
-        return np.array([]), 0.0
+    # Validate cost sign BEFORE the empty-input early return, so a negative cost
+    # always raises regardless of array size (previously empty input returned
+    # first, silently bypassing this guard).
     if cost_bps_rt < 0 or slippage_bps < 0:
         raise ValueError("cost_bps_rt and slippage_bps must be non-negative")
+    if g.size == 0:
+        return np.array([]), 0.0
     fee = n * (cost_bps_rt + slippage_bps) / 10000.0
     net = g - fee
     return net, float(fee.sum())
@@ -1870,8 +1919,7 @@ def per_strategy_live_table(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
     (live PF vs what backtest predicts under live's regime mix). Otherwise
     falls back to the simple regime-blind classifier.
     """
-    ignore = {'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-              'B&H BTC Equity', 'Portfolio Load'}
+    ignore = PORTFOLIO_RESERVED_COLS
     strategy_cols = [c for c in plot_data.columns if c not in ignore]
     if not strategy_cols:
         return pd.DataFrame()
@@ -3127,8 +3175,7 @@ def live_monitoring_analysis(plot_data: pd.DataFrame, metrics_df: pd.DataFrame,
     cost_pct = (vt_kwargs.get('cost_bps_per_round_trip', 0) +
                 vt_kwargs.get('slippage_bps', 0)) / 10000.0
     funding_pct_day = vt_kwargs.get('funding_bps_per_day', 0) / 10000.0
-    ignore = {'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-              'B&H BTC Equity', 'Portfolio Load'}
+    ignore = PORTFOLIO_RESERVED_COLS
     for col in [c for c in live_plot.columns if c not in ignore]:
         if col not in vt_bt['position_sizes']:
             continue
@@ -3273,8 +3320,7 @@ def _metrics_from_pnl_only(plot_data_subset: pd.DataFrame,
     re-computed from the subset's active days. This is the input required by
     mc_vol_targeted_allocation when re-running on a date sub-range.
     """
-    ignore = {'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-              'B&H BTC Equity', 'Portfolio Load'}
+    ignore = PORTFOLIO_RESERVED_COLS
     strategy_cols = [c for c in plot_data_subset.columns if c not in ignore]
     n = max(len(strategy_cols), 1)
     per_strat_cap = total_cap / n
@@ -3410,12 +3456,10 @@ def smart_sharpe(daily_returns: pd.Series, rfr: float = DEFAULT_RFR,
 def kelly_criterion(daily_returns: pd.Series) -> float:
     """Optimal bet fraction = mean / variance. Returned as fraction (0.15 = 15%)."""
     r = pd.Series(daily_returns).dropna()
-    # len < 2: pandas .var() uses ddof=1 → NaN for a single point, which would
-    # slip past `== 0` and return NaN. Require ≥2 obs (same class of guard as
-    # get_risk_ratios). var==0 (all-identical returns) → no edge → 0.
-    if len(r) < 2 or r.var() == 0:
+    var = safe_var(r)  # 0.0 for <2 obs (pandas .var ddof=1 → NaN on one point)
+    if var == 0:
         return 0.0
-    return float(r.mean() / r.var())
+    return float(r.mean() / var)
 
 
 def beta_alpha_correlation(returns: pd.Series, bench_returns: pd.Series,
@@ -3445,9 +3489,10 @@ def information_ratio(returns: pd.Series, bench_returns: pd.Series) -> float:
         return 0.0
     aligned.columns = ['r', 'b']
     active = aligned['r'] - aligned['b']
-    if active.std() == 0:
+    sd = safe_std(active)
+    if sd == 0:
         return 0.0
-    return float((active.mean() / active.std()) * ANNUALIZATION_FACTOR)
+    return float((active.mean() / sd) * ANNUALIZATION_FACTOR)
 
 
 def treynor_ratio(returns: pd.Series, bench_returns: pd.Series,
@@ -3672,7 +3717,6 @@ def stress_correlation(plot_data: pd.DataFrame, percentile: int = 10) -> pd.Data
     port_pnl = plot_data['Portfolio Daily P&L']
     threshold = port_pnl.quantile(percentile / 100.0)
     bad_days = plot_data[port_pnl <= threshold]
-    ignore = {'Portfolio Equity', 'Portfolio DD', 'Portfolio Daily P&L',
-              'B&H BTC Equity', 'Portfolio Load'}
+    ignore = PORTFOLIO_RESERVED_COLS
     strategy_cols = [c for c in plot_data.columns if c not in ignore]
     return bad_days[strategy_cols].corr()

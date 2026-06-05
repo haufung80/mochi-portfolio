@@ -76,6 +76,14 @@ def build_snapshot() -> dict:
     finally:
         C.fetch_btc_daily = orig
 
+    # Fail loudly if the pipeline loaded nothing: process_portfolio returns an
+    # error dict (no 'Final Equity' key) when every CSV fails, and snapshotting
+    # that would silently bake 0.0 / 0 strategies as the baseline.
+    if "Final Equity" not in port_stats or len(metrics_df) == 0:
+        raise RuntimeError(
+            f"process_portfolio loaded no strategies from {DATA_DIR} "
+            f"(failed_files={port_stats.get('failed_files')}) — refusing to snapshot.")
+
     metrics = {
         str(strat): {k: float(metrics_df.loc[strat, k]) for k in _METRIC_KEYS}
         for strat in metrics_df.index
@@ -87,7 +95,7 @@ def build_snapshot() -> dict:
         "vt_positions": vt_positions,
         "vt_portfolio_scale": float(vt["portfolio_scale"]),
         "vt_portfolio_vol": float(vt["portfolio_vol"]),
-        "port_final_equity": float(port_stats.get("Final Equity", 0.0)),
+        "port_final_equity": float(port_stats["Final Equity"]),  # guarded above
     }
 
 
@@ -106,8 +114,12 @@ def _compare(expected: dict, actual: dict) -> list[str]:
             e, a = expected["metrics"][strat][k], actual["metrics"][strat].get(k)
             if a is None or not np.isclose(e, a, rtol=_TOL_METRICS, atol=1e-9):
                 diffs.append(f"{strat}.{k}: {e:.6g} → {a}")
-    # VT position sizes
-    for strat in set(expected["vt_positions"]) & set(actual["vt_positions"]):
+    # VT position sizes — assert membership first; a key present on only one side
+    # would otherwise be silently skipped by the intersection loop below.
+    exp_vt, act_vt = set(expected["vt_positions"]), set(actual["vt_positions"])
+    if exp_vt != act_vt:
+        diffs.append(f"vt_positions set changed: +{act_vt - exp_vt} -{exp_vt - act_vt}")
+    for strat in exp_vt & act_vt:
         e = expected["vt_positions"][strat]
         a = actual["vt_positions"][strat]
         if not np.isclose(e, a, rtol=_TOL_VT, atol=1e-6):
@@ -123,17 +135,33 @@ def _maybe_regen() -> bool:
     return os.environ.get("GOLDEN_REGEN") == "1" or "--regen" in sys.argv
 
 
+def _write_snapshot(snap: dict) -> None:
+    """Single writer for both the pytest-regen path and the __main__ CLI path."""
+    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT.write_text(json.dumps(snap, indent=2, sort_keys=True))
+
+
 @pytest.mark.skipif(not DATA_DIR.exists(),
                     reason=f"portfolio data folder not present: {DATA_DIR}")
 def test_golden_master_pipeline():
-    """The live pipeline's numbers match the committed snapshot (or regen)."""
+    """The live pipeline's numbers match the committed snapshot.
+
+    A MISSING snapshot FAILS (it is the committed regression baseline) — only an
+    EXPLICIT regen (GOLDEN_REGEN=1 / --regen) writes it. This avoids the
+    anti-pattern where a missing reference silently regenerates + skips green,
+    anointing possibly-regressed output as the new baseline.
+    """
     actual = build_snapshot()
-    existed = SNAPSHOT.exists()
-    if _maybe_regen() or not existed:
-        SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-        SNAPSHOT.write_text(json.dumps(actual, indent=2, sort_keys=True))
+    if _maybe_regen():
+        existed = SNAPSHOT.exists()
+        _write_snapshot(actual)
         pytest.skip(f"snapshot {'regenerated' if existed else 'created'} "
                     f"at {SNAPSHOT} ({actual['n_strategies']} strategies)")
+    if not SNAPSHOT.exists():
+        pytest.fail(
+            f"golden snapshot missing at {SNAPSHOT} — it is the committed regression "
+            f"baseline. Generate it intentionally with `GOLDEN_REGEN=1 pytest "
+            f"{Path(__file__).name}` and commit the result.")
     expected = json.loads(SNAPSHOT.read_text())
     diffs = _compare(expected, actual)
     assert not diffs, (
@@ -153,9 +181,7 @@ def test_portfolio_conservation_real_data():
             str(DATA_DIR), C.DEFAULT_CAPITAL, C.DEFAULT_RFR, *_OOS)
     finally:
         C.fetch_btc_daily = orig
-    reserved = {"Portfolio Equity", "Portfolio DD", "Portfolio Daily P&L",
-                "B&H BTC Equity", "Portfolio Load"}
-    strat_cols = [c for c in plot_data.columns if c not in reserved]
+    strat_cols = [c for c in plot_data.columns if c not in C.PORTFOLIO_RESERVED_COLS]
     reconstructed = plot_data[strat_cols].sum(axis=1).cumsum() + C.DEFAULT_CAPITAL
     assert np.allclose(reconstructed.values, plot_data["Portfolio Equity"].values, atol=1e-6)
 
@@ -165,7 +191,6 @@ if __name__ == "__main__":
     if not DATA_DIR.exists():
         sys.exit(f"data folder not found: {DATA_DIR}")
     snap = build_snapshot()
-    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-    SNAPSHOT.write_text(json.dumps(snap, indent=2, sort_keys=True))
+    _write_snapshot(snap)
     print(f"wrote {SNAPSHOT} — {snap['n_strategies']} strategies, "
           f"scale {snap['vt_portfolio_scale']:.3f}x")

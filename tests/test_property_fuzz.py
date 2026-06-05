@@ -63,14 +63,14 @@ class TestNeverRaises:
     def test_rolling_calmar_never_complex_or_raises(self, pnl, cap):
         """REGRESSION: rolling_calmar threw 'float() argument ... complex' when
         a trailing window's equity went negative (negative base ^ fractional
-        power). Must return a real-valued Series for ANY P&L, including curves
-        that go deeply negative."""
+        power). The regression guard is that this RETURNS (does not raise) for
+        ANY P&L incl. deeply-negative curves — reaching the asserts below means
+        no TypeError fired — and yields a real float Series with finite values."""
         s = _series(pnl)
         out = C.rolling_calmar(s, starting_capital=cap, window=30)
         assert isinstance(out, pd.Series)
-        finite = out.dropna()
-        assert np.isreal(finite.values).all()
-        assert np.isfinite(finite.values).all()
+        assert out.dtype.kind == "f"  # real float dtype, never complex (the bug widened to complex)
+        assert np.isfinite(out.dropna().values).all()
 
     @given(pnl=pnl_arrays)
     def test_max_drawdown_path_total(self, pnl):
@@ -131,6 +131,17 @@ class TestBoundsHold:
         with pytest.raises(ValueError):
             C.net_of_fees(gross, notional, cost, 0.0)
 
+    def test_net_of_fees_rejects_negative_cost_even_when_empty(self):
+        """REGRESSION: negative-cost validation must run BEFORE the empty-array
+        early return, so a negative cost raises regardless of input size (the
+        empty case previously returned (array([]), 0.0) and bypassed the guard)."""
+        for g, n in [(np.array([1.0, -2.0, 3.0]), np.full(3, 100.0)),
+                     (np.array([]), np.array([]))]:
+            with pytest.raises(ValueError):
+                C.net_of_fees(g, n, cost_bps_rt=-5.0)
+            with pytest.raises(ValueError):
+                C.net_of_fees(g, n, slippage_bps=-1.0)
+
     @given(
         sr=st.floats(-2.0, 6.0),
         n_trials=st.integers(1, 500),
@@ -172,3 +183,12 @@ class TestDegenerate:
         assert C.get_risk_ratios(pd.Series([0.01]), 0.0) == (0.0, 0.0)
         assert C.kelly_criterion(pd.Series([0.01])) == 0.0
         assert C.kelly_criterion(pd.Series(dtype=float)) == 0.0
+
+    def test_rolling_calmar_negative_equity_does_not_raise(self):
+        """The exact crash shape: a curve whose trailing-window equity dives below
+        zero must NOT raise (was 'TypeError: float() argument ... complex')."""
+        idx = pd.date_range("2024-01-01", periods=60, freq="D")
+        pnl = pd.Series([-50.0] * 60, index=idx)  # equity goes deeply negative
+        out = C.rolling_calmar(pnl, starting_capital=100.0, window=30)  # must not raise
+        assert isinstance(out, pd.Series)
+        assert np.isfinite(out.dropna().values).all()  # all-NaN gap is fine; never inf/complex

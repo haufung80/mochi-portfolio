@@ -94,14 +94,15 @@ class TestBounds:
         assert (dd_series <= 1e-12).all()  # drawdown is never positive
 
     def test_get_max_drawdown_impossible_value_regression(self):
-        """REGRESSION: the 92%+ MaxDD bug. A $50 drop from a $1500 peak is a
-        3.3% drawdown, NOT a fraction of starting capital. Peak-relative only."""
+        """REGRESSION: the 92%+ MaxDD bug. For equity [1000,1500,1450,1400,1450]
+        the worst drop is $100 from the $1500 peak = 6.67% (peak-relative), NOT a
+        fraction of starting capital. (Numbers match the fixture + assert below.)"""
         eq = pd.Series(
             [1000, 1500, 1450, 1400, 1450],
             index=pd.date_range("2024-01-01", periods=5, freq="D"),
         )
         mdd, _ = C.get_max_drawdown(eq, 1000.0)
-        assert mdd == pytest.approx(-100 / 1500, abs=1e-9)  # 6.67%, not 10%
+        assert mdd == pytest.approx(-100 / 1500, abs=1e-9)  # 6.67% = $100 drop / $1500 peak
 
     def test_profit_factor_nonnegative(self):
         for seed in range(20):
@@ -253,6 +254,26 @@ class TestConservation:
         assert sum(v["pnl"] for v in split.values()) == pytest.approx(float(pnl.sum()))
         assert sum(v["days"] for v in split.values()) == len(pnl)
 
+    def test_regime_phase_split_conserves_over_overlap_only(self):
+        """When the regime series starts AFTER pnl begins, regime_phase_split
+        buckets only the overlapping (ffill-able) dates — leading pnl dates stay
+        NaN and are excluded. Documents the REAL contract: conservation holds over
+        the overlap, NOT unconditionally over all of pnl (the prior test's
+        identical-index fixture could never exercise this boundary)."""
+        idx = pd.date_range("2024-01-01", periods=10, freq="D")
+        pnl = pd.Series(range(1, 11), index=idx, dtype=float)   # sum 55, 10 days
+        regimes = pd.Series("Bull", index=idx[3:])              # labels only last 7 days
+        split = C.regime_phase_split(pnl, regimes)
+        covered_days = sum(v["days"] for v in split.values())
+        covered_pnl = sum(v["pnl"] for v in split.values())
+        # Only the 7 overlapping days are bucketed — NOT all 10 / sum 55
+        assert covered_days == 7
+        assert covered_pnl == pytest.approx(float(pnl.iloc[3:].sum()))  # 4+...+10 = 49
+        # Conservation holds EXACTLY over that overlap
+        overlap = pnl.loc[regimes.index]
+        assert covered_days == len(overlap)
+        assert covered_pnl == pytest.approx(float(overlap.sum()))
+
     def test_portfolio_equity_equals_sum_of_strategies(self, tmp_path, monkeypatch):
         """process_portfolio: Portfolio Equity == total_cap + cumulative row-sum
         of every strategy column. Real aggregation path, network-free (BTC fetch
@@ -265,10 +286,44 @@ class TestConservation:
             str(tmp_path), total_cap=2000.0, risk_free_rate=0.04,
             oos_start="2024-01-01", oos_end="2026-05-22")
 
-        reserved_cols = {"Portfolio Equity", "Portfolio DD", "Portfolio Daily P&L",
-                         "B&H BTC Equity", "Portfolio Load"}
-        strat_cols = [c for c in plot_data.columns if c not in reserved_cols]
+        strat_cols = [c for c in plot_data.columns if c not in C.PORTFOLIO_RESERVED_COLS]
         assert strat_cols, "expected synthetic strategies to load"
         reconstructed = plot_data[strat_cols].sum(axis=1).cumsum() + 2000.0
         assert np.allclose(reconstructed.values,
                            plot_data["Portfolio Equity"].values, atol=1e-6)
+
+
+# ===========================================================================
+# NUMERIC SAFETY — the shared safe_std/safe_var seam + the functions that route
+# through it must degrade to 0.0/1.0 (never NaN/inf) on degenerate samples.
+# (Regression for the ddof=1-single-obs NaN class found by the code review.)
+# ===========================================================================
+
+class TestNumericSafety:
+    @pytest.mark.parametrize("fn", [C.safe_std, C.safe_var])
+    def test_safe_std_var_zero_not_nan_on_short_input(self, fn):
+        assert fn(pd.Series([0.05])) == 0.0          # 1 obs → 0.0, not NaN (ddof=1)
+        assert fn(pd.Series(dtype=float)) == 0.0     # empty → 0.0
+        v = fn(pd.Series([1.0, 2.0, 3.0]))
+        assert np.isfinite(v) and v > 0.0            # ≥2 obs → real positive value
+
+    def test_get_div_ratio_single_obs_returns_one_not_nan(self):
+        """REGRESSION: get_div_ratio used port.std() (ddof=1 → NaN on one row),
+        surviving only by the NaN>0=False accident. Single-day portfolio → 1.0."""
+        idx = pd.date_range("2024-01-01", periods=1, freq="D")
+        all_pnl = pd.DataFrame({"A": [3.0], "B": [-2.0]}, index=idx)
+        port = all_pnl.sum(axis=1)
+        r = C.get_div_ratio(all_pnl, port)
+        assert np.isfinite(r) and r == 1.0
+
+    def test_rolling_sharpe_short_series_all_nan_not_inf(self):
+        """REGRESSION: rolling_sharpe used an unguarded ddof=1 rolling std. A
+        series shorter than `window` must yield an all-NaN gap (never inf/crash),
+        and a constant window must not emit +inf."""
+        idx = pd.date_range("2024-01-01", periods=40, freq="D")
+        short = pd.Series(_rng(3).normal(0, 0.01, 40), index=idx)
+        out = C.rolling_sharpe(short, window=60)           # 40 < 60 → all NaN
+        assert len(out) == 40 and out.isna().all()
+        constant = pd.Series([0.01] * 80, index=pd.date_range("2024-01-01", periods=80, freq="D"))
+        out2 = C.rolling_sharpe(constant, window=60)        # zero-vol windows → NaN, not inf
+        assert not np.isinf(out2.dropna().values).any()
