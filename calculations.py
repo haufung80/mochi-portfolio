@@ -233,11 +233,15 @@ def extract_ticker(filename: str) -> str:
 
 
 def profit_factor(trade_pnls: np.ndarray) -> float:
-    """gains / |losses|; inf when no losses."""
+    """gains / |losses|; inf when losses are zero or negligibly small."""
     gains = trade_pnls[trade_pnls > 0].sum()
     losses = trade_pnls[trade_pnls < 0].sum()
     denom = abs(losses)
-    return np.inf if denom == 0 else float(gains / denom)
+    if denom == 0:
+        return np.inf
+    with np.errstate(over='ignore'):  # vanishingly small losses → PF overflows to +inf
+        pf = float(gains / denom)
+    return pf if np.isfinite(pf) else np.inf
 
 
 def max_drawdown_path(equity_path: np.ndarray) -> Tuple[float, float]:
@@ -306,11 +310,15 @@ def get_max_duration(dates: pd.Series, dd_series: pd.Series) -> int:
 
 def get_risk_ratios(daily_returns: pd.Series, risk_free_annual: float) -> Tuple[float, float]:
     """Annualized Sharpe and Sortino."""
-    if daily_returns.empty or daily_returns.std() == 0:
+    # Need ≥2 observations: pandas .std() uses ddof=1, so a SINGLE data point
+    # returns NaN (not 0). A bare `std() == 0` guard evaluates `NaN == 0` → False,
+    # letting NaN poison Sharpe/Sortino. Guard on length + finiteness explicitly.
+    std = daily_returns.std() if len(daily_returns) >= 2 else 0.0
+    if daily_returns.empty or not np.isfinite(std) or std == 0:
         return 0.0, 0.0
     rf_daily = risk_free_annual / TRADING_DAYS_PER_YEAR
     excess = daily_returns - rf_daily
-    sharpe = float((excess.mean() / daily_returns.std()) * ANNUALIZATION_FACTOR)
+    sharpe = float((excess.mean() / std) * ANNUALIZATION_FACTOR)
     downside = np.minimum(0, excess)
     downside_dev = np.sqrt(np.mean(downside ** 2))
     sortino = float((excess.mean() / downside_dev) * ANNUALIZATION_FACTOR) if downside_dev > 0 else 0.0
@@ -685,11 +693,7 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
                 total_pnl = exits['Net P&L USDT'].sum()
                 final_equity = initial_cap_per_strat + total_pnl
                 cagr = get_cagr(initial_cap_per_strat, final_equity, days)
-                mdd, dd_series = get_max_drawdown(equity_curve, initial_cap_per_strat)
-                mdd_duration = get_max_duration(
-                    exits['Date/Time'].reset_index(drop=True),
-                    dd_series.reset_index(drop=True)
-                )
+                mdd, _ = get_max_drawdown(equity_curve, initial_cap_per_strat)
                 calmar = cagr / abs(mdd) if mdd != 0 else 0.0
                 sharpe, sortino = get_risk_ratios(daily_rets, risk_free_rate)
 
@@ -955,7 +959,6 @@ def mc_vol_targeted_allocation(plot_data: pd.DataFrame, metrics_df: pd.DataFrame
     # with the per-trade pct_net used in RoR computation above).
     # Daily-amortized: trade cost spread evenly across 365 days, funding charged daily.
     if cost_pct > 0 or funding_pct_per_day > 0:
-        n_days = max(len(port_pnl), 1)
         for col in strategy_cols:
             if col not in metrics_df.index:
                 continue
@@ -2019,7 +2022,6 @@ def strategy_family_table(strategy_table: pd.DataFrame) -> pd.DataFrame:
             # one ticker, then promote to a 2nd ticker if it works.
             single_status = statuses[0]
             single_live_days = int(group['Live Trade Days'].iloc[0])
-            single_live_pnl = float(group['Live P&L $'].iloc[0])
             single_pf_ratio = float(group['PF Ratio %'].iloc[0])
 
             if single_status.startswith('⏳'):
@@ -3408,7 +3410,10 @@ def smart_sharpe(daily_returns: pd.Series, rfr: float = DEFAULT_RFR,
 def kelly_criterion(daily_returns: pd.Series) -> float:
     """Optimal bet fraction = mean / variance. Returned as fraction (0.15 = 15%)."""
     r = pd.Series(daily_returns).dropna()
-    if len(r) == 0 or r.var() == 0:
+    # len < 2: pandas .var() uses ddof=1 → NaN for a single point, which would
+    # slip past `== 0` and return NaN. Require ≥2 obs (same class of guard as
+    # get_risk_ratios). var==0 (all-identical returns) → no edge → 0.
+    if len(r) < 2 or r.var() == 0:
         return 0.0
     return float(r.mean() / r.var())
 
