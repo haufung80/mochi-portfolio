@@ -292,6 +292,27 @@ class TestConservation:
         assert np.allclose(reconstructed.values,
                            plot_data["Portfolio Equity"].values, atol=1e-6)
 
+    def test_process_portfolio_include_filter(self, tmp_path, monkeypatch):
+        """include_strategies restricts the portfolio to the named CSVs and splits
+        capital across ONLY those — the rest are absent from metrics + plot_data."""
+        monkeypatch.setattr(C, "fetch_btc_daily", lambda *a, **k: pd.DataFrame())
+        names = ["AAA_BINANCE_BTCUSDT_2026-05-23",
+                 "BBB_BINANCE_ETHUSDT_2026-05-23",
+                 "CCC_BINANCE_SOLUSDT_2026-05-23"]
+        for nm, seed in zip(names, (41, 42, 43)):
+            _write_tv_csv(tmp_path / f"{nm}.csv", seed=seed)
+        keep = {names[0], names[1]}  # exclude CCC
+        metrics_df, _, plot_data, _ = C.process_portfolio(
+            str(tmp_path), 3000.0, 0.04, "2024-01-01", "2026-05-22",
+            include_strategies=keep)
+        strat_cols = {c for c in plot_data.columns if c not in C.PORTFOLIO_RESERVED_COLS}
+        assert strat_cols == keep
+        assert set(metrics_df.index) == keep
+        assert names[2] not in plot_data.columns           # CCC fully excluded
+        m_all, _, _, _ = C.process_portfolio(
+            str(tmp_path), 3000.0, 0.04, "2024-01-01", "2026-05-22")
+        assert len(m_all) == 3                              # default None loads all 3
+
 
 # ===========================================================================
 # NUMERIC SAFETY — the shared safe_std/safe_var seam + the functions that route

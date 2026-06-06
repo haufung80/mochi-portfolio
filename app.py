@@ -1110,23 +1110,63 @@ def _folder_fingerprint(folder: str) -> tuple:
 
 
 @st.cache_data(show_spinner=False)
-def load_portfolio_data(folder, start, end, rfr, cap, folder_fp):
+def list_strategy_names(folder, folder_fp):
+    """All strategy names (CSV stems) in the folder — the full universe for the
+    portfolio-composition selector, independent of the current inclusion filter."""
+    return sorted(p.stem for p in Path(folder).glob('*.csv'))
+
+
+@st.cache_data(show_spinner=False)
+def load_portfolio_data(folder, start, end, rfr, cap, folder_fp, include_fp):
     """Load + aggregate strategy CSVs; BTC benchmark auto-fetched inside process_portfolio.
 
-    `folder_fp` is part of the cache key — when any CSV in the folder is
-    edited/added/removed, the fingerprint changes and Streamlit reloads.
+    `folder_fp` busts the cache when any CSV is edited/added/removed. `include_fp`
+    (a sorted tuple of strategy names, or None for all) restricts the portfolio to
+    a subset — it's part of the cache key, so each composition is cached separately.
     """
-    return process_portfolio(str(folder), cap, rfr, start, end)
+    include = set(include_fp) if include_fp else None
+    return process_portfolio(str(folder), cap, rfr, start, end, include_strategies=include)
 
 
 def df_to_csv_bytes(df: pd.DataFrame, index: bool = True) -> bytes:
     return df.to_csv(index=index).encode('utf-8')
 
 
+def clear_derived_caches():
+    """Drop EVERY session-state cache derived from the loaded portfolio so a
+    composition change (or any data-identity change) forces a full recompute
+    across ALL tabs — vol-targeting, live monitoring, Forward-Risk MC, and the
+    MC envelope.
+
+    This is the SINGLE source of "what depends on the loaded data". Any new
+    session_state cache that is derived from plot_data/metrics_df MUST be added
+    here — otherwise excluding a strategy can leave a tab showing stale results
+    (the exact bug this guards). tests/test_composition_integration.py asserts
+    that an exclusion propagates to every tab, so a forgotten cache fails CI.
+    """
+    for _k in ('vt_alloc', 'vt_data_fp',
+               'live_view', 'live_fp',
+               'mc_results', 'mc_fp', 'mc_start_used', 'mc_ruin_used',
+               'port_env_df', 'port_env_fp'):
+        st.session_state.pop(_k, None)
+
+
 _folder_fp = _folder_fingerprint(portfolio_folder)
-with st.spinner(f"Loading portfolio ({_folder_fp[0]} CSVs) + auto-fetching BTC benchmark..."):
+_all_strat_names = list_strategy_names(portfolio_folder, _folder_fp)
+# Portfolio composition — which strategies are included (set by the Rerun button in
+# the Portfolio tab). None = all. Intersected with the live universe so a stale
+# selection can't break the load; part of the cache key so a change recomputes the
+# whole portfolio for the subset.
+_applied_strats = st.session_state.get('applied_strats')
+if _applied_strats is not None:
+    _applied_strats = set(_applied_strats) & set(_all_strat_names)
+    if not _applied_strats:
+        _applied_strats = None  # nothing valid selected → fall back to all
+_include_fp = tuple(sorted(_applied_strats)) if _applied_strats else None
+_n_load = len(_include_fp) if _include_fp else _folder_fp[0]
+with st.spinner(f"Loading portfolio ({_n_load} strategies) + auto-fetching BTC benchmark..."):
     metrics_df, port_stats, plot_data, exposure_df = load_portfolio_data(
-        portfolio_folder, oos_start, oos_end, risk_free_rate, total_cap, _folder_fp
+        portfolio_folder, oos_start, oos_end, risk_free_rate, total_cap, _folder_fp, _include_fp
     )
 
 # Surface any silent CSV parse failures so we don't get masked schema breaks again
@@ -1186,7 +1226,7 @@ def auto_compute_vt():
         float(cost_bps_rt) if eff_apply_cost else 0.0,
         float(slippage_bps) if eff_apply_cost else 0.0,
         float(funding_bps) if eff_apply_cost else 0.0,
-        oos_start, oos_end, portfolio_folder,
+        oos_start, oos_end, portfolio_folder, _include_fp,
         plot_data.shape, len(metrics_df),
         int(mc_block_len), int(mc_seed),
         float(eff_target_ror), float(eff_ruin_frac),
@@ -1343,11 +1383,13 @@ def auto_compute_live():
             )
         }
         return
-    # Fingerprint MUST include every sidebar parameter that affects the output —
-    # otherwise stale cached verdicts are silently returned when the user adjusts
-    # MC seed/block/runs. Bug found in audit: changing mc_seed didn't refresh.
+    # Fingerprint MUST include every input that affects the output — sidebar params
+    # AND the portfolio composition (_include_fp). Otherwise excluding a strategy
+    # (which does NOT change the folder on disk) leaves a STALE live_view — the
+    # reported bug. clear_derived_caches() is the primary guard; keeping _include_fp
+    # here makes the fingerprint correct independently too.
     live_fp = (
-        _folder_fp,
+        _folder_fp, _include_fp,
         oos_start, oos_end, live_start,
         float(total_cap), float(risk_free_rate),
         float(cost_bps_rt) if applies_cost else 0.0,
@@ -1697,8 +1739,7 @@ if active_tab == TAB_PORT:
 
         strategy_cols = [c for c in plot_data.columns if c not in PORTFOLIO_RESERVED_COLS]
 
-        c_show1, c_show2, c_show3 = st.columns(3)
-        show_individual = c_show1.checkbox("Show individual strategies (raw)", value=False)
+        c_show2, c_show3 = st.columns(2)
         show_benchmark = c_show2.checkbox("Show B&H benchmark", value=True)
         show_envelope = c_show3.checkbox(
             "Show MC envelope (±2σ)", value=True,
@@ -1710,7 +1751,54 @@ if active_tab == TAB_PORT:
                  "Live line sustained below P5 = statistically rare → regime change.",
         )
 
-        per_strat_cap = per_strategy_capital(total_cap, len(strategy_cols))
+        # ── Portfolio composition: choose which strategies make up the portfolio,
+        # then Rerun to recompute the WHOLE dashboard (every tab) on just those.
+        # The checkbox universe is the full folder (_all_strat_names) so an excluded
+        # strategy can be re-added; `applied_strats` (session_state) drives the load.
+        _applied = st.session_state.get('applied_strats')
+        _nonce = st.session_state.get('inc_nonce', 0)
+        # Keep the expander OPEN whenever the checkboxes differ from what's applied
+        # (an unsaved edit). Streamlit re-applies `expanded` on every rerun, so a
+        # fixed expanded=False snaps the panel shut after each checkbox toggle;
+        # deriving it from the pending checkbox states (read from session_state)
+        # keeps it open while the user is selecting and collapses once applied.
+        _applied_set = set(_all_strat_names) if _applied is None else set(_applied)
+        _has_pending = any(
+            st.session_state.get(f"inc_{name}_{_nonce}", name in _applied_set) != (name in _applied_set)
+            for name in _all_strat_names
+        )
+        with st.expander(
+            f"🧩 Portfolio composition — {len(strategy_cols)} of {len(_all_strat_names)} strategies included",
+            expanded=_has_pending,
+        ):
+            st.caption("Uncheck strategies and press Rerun to recompute the entire "
+                       "dashboard (all tabs) on only the selected strategies — total "
+                       "capital is re-split equally across them.")
+            _cc = st.columns(3)
+            _pending = [
+                name for i, name in enumerate(_all_strat_names)
+                if _cc[i % 3].checkbox(
+                    f"{extract_family(name)} · {extract_ticker(name).replace('USDT', '')}",
+                    value=(_applied is None or name in _applied),
+                    key=f"inc_{name}_{_nonce}",
+                )
+            ]
+            _b1, _b2 = st.columns([3, 1])
+            if _b1.button("🔄 Rerun with selected strategies", type="primary",
+                          disabled=not _pending):
+                st.session_state['applied_strats'] = set(_pending)
+                clear_derived_caches()  # propagate to ALL tabs, not just VT
+                st.rerun()
+            if _b2.button(f"↺ All {len(_all_strat_names)}", disabled=(_applied is None)):
+                st.session_state.pop('applied_strats', None)
+                st.session_state['inc_nonce'] = _nonce + 1
+                clear_derived_caches()
+                st.rerun()
+            if not _pending:
+                st.warning("Select at least one strategy before rerunning.")
+            elif set(_pending) != (set(_all_strat_names) if _applied is None else set(_applied)):
+                st.info(f"{len(_pending)} selected — press Rerun to apply.")
+
         fig = go.Figure()
 
         # ── MC Envelope (proper OOS hypothesis test) ──
@@ -1797,15 +1885,6 @@ if active_tab == TAB_PORT:
                         name='MC P50 (expected median from BT)',
                     ))
 
-        if show_individual:
-            for col in strategy_cols:
-                strat_eq = plot_data[col].cumsum() + per_strat_cap
-                y = (strat_eq / per_strat_cap - 1) * 100
-                fig.add_trace(go.Scatter(
-                    x=plot_data.index, y=y, name=col,
-                    line=dict(color='rgba(128,128,128,0.25)', width=1),
-                    hoverinfo="skip", showlegend=False,
-                ))
         # Portfolio trace: Return % on left axis, with Equity $ shown in hover.
         # customdata carries the dollar value so the unified-hover popup shows
         # BOTH "+178% · $2,780" on one line per data point.

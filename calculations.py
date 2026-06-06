@@ -661,6 +661,7 @@ def find_max_safe_leverage(pct_returns_net: np.ndarray, trades_per_year: int,
 
 def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
                      oos_start: str, oos_end: str,
+                     include_strategies: Optional[set] = None,
                      ) -> Tuple[pd.DataFrame, dict, pd.DataFrame, pd.DataFrame]:
     """Load every strategy CSV from `folder` and aggregate into a portfolio view.
 
@@ -674,6 +675,9 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
         risk_free_rate: annualized risk-free rate (e.g., 0.04 = 4%)
         oos_start: ISO date 'YYYY-MM-DD' — filter trades to ≥ this date
         oos_end: ISO date 'YYYY-MM-DD' — filter trades to ≤ this date
+        include_strategies: if given, only CSVs whose stem is in this set are
+            loaded and capital is split across ONLY those — i.e. the whole
+            portfolio is recomputed for the subset. None = all CSVs.
 
     Returns:
         Tuple of (metrics_df, port_stats, plot_data, exposure_df):
@@ -683,6 +687,8 @@ def process_portfolio(folder: str, total_cap: float, risk_free_rate: float,
           • exposure_df: daily exposure per strategy (for max-load analysis)
     """
     files = glob.glob(f"{folder}/*.csv")
+    if include_strategies is not None:
+        files = [f for f in files if Path(f).stem in include_strategies]
     if not files:
         return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
 
