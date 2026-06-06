@@ -1815,7 +1815,9 @@ if active_tab == TAB_PORT:
             x=port_equity_active.index, y=port_y, name=view_label,
             line=dict(color=view_color, width=3),
             customdata=port_dollars,
-            hovertemplate='<b>%{y:+.2f}%</b> · <b>$%{customdata:,.0f}</b><extra>' + view_label + '</extra>',
+            # NOTE: no '+' in the % format — plotly's hovertemplate parser fails on
+            # %{y:+.1f} and falls back to the raw float; %{y:.1f} renders correctly.
+            hovertemplate='<b>%{y:.1f}%</b> · <b>$%{customdata:,.0f}</b><extra>' + view_label + '</extra>',
         ))
         if show_benchmark and 'B&H BTC Equity' in plot_data.columns:
             bh_eq = plot_data['B&H BTC Equity']
@@ -1824,13 +1826,13 @@ if active_tab == TAB_PORT:
                 x=plot_data.index, y=bh_y, name="B&H BTC",
                 line=dict(color="#f39c12", width=2, dash="dash"),
                 customdata=bh_eq.values,
-                hovertemplate='<b>%{y:+.2f}%</b> · <b>$%{customdata:,.0f}</b><extra>B&H BTC</extra>',
+                hovertemplate='<b>%{y:.1f}%</b> · <b>$%{customdata:,.0f}</b><extra>B&H BTC</extra>',
             ))
 
-        # ── Secondary Y-axis: Equity $ scale ──
-        # Invisible anchor trace on yaxis2 forces the right axis range to mirror
-        # the portfolio's dollar values. Both axes scale together because
-        # equity_$ = total_cap × (1 + return%/100), so they share the same shape.
+        # Invisible anchor trace on yaxis2 — an overlaying axis only RENDERS when
+        # at least one trace is assigned to it (an explicit range alone won't show
+        # the axis). Its values don't matter; yaxis2.range below sets the scale so
+        # the $ axis stays an exact linear image of the Return % axis.
         if not port_equity_active.empty:
             fig.add_trace(go.Scatter(
                 x=port_equity_active.index, y=port_dollars,
@@ -1849,14 +1851,29 @@ if active_tab == TAB_PORT:
             label=f"📡 Live starts {pd.Timestamp(live_start).strftime('%Y-%m-%d')}",
             bounds=_port_bounds,
         )
+        # Link the two Y-axes: Equity $ must be an EXACT linear image of Return %
+        # (equity_$ = total_cap × (1 + %/100)). Otherwise plotly auto-ranges each
+        # axis independently — driven by different traces (the % axis spans the
+        # envelope/B&H/strategy lines, the $ axis only the portfolio) — and the $
+        # scale stops lining up with the curve. Compute the % range over every
+        # left-axis trace, then derive the matching $ range from the same endpoints.
+        _pct = [np.asarray(tr.y, dtype=float) for tr in fig.data
+                if getattr(tr, 'yaxis', None) in (None, 'y') and tr.y is not None]
+        _pct = np.concatenate([a[np.isfinite(a)] for a in _pct]) if _pct else np.array([0.0])
+        if not _pct.size:
+            _pct = np.array([0.0])
+        _lo, _hi = float(_pct.min()), float(_pct.max())
+        _pad = max((_hi - _lo) * 0.05, 1.0)
+        _lo, _hi = _lo - _pad, _hi + _pad
         fig.update_layout(
             title=f"{view_label} vs Benchmark (Return % + Equity $)",
             xaxis_title="Date",
-            yaxis=dict(title="Return %"),
+            yaxis=dict(title="Return %", range=[_lo, _hi],
+                       ticksuffix="%", tickformat=",.0f", hoverformat=".1f"),
             yaxis2=dict(
                 title="Equity ($)",
-                overlaying='y', side='right',
-                showgrid=False,
+                overlaying='y', side='right', showgrid=False,
+                range=[total_cap * (1 + _lo / 100), total_cap * (1 + _hi / 100)],
                 tickformat="$,.0f",
             ),
             hovermode="x unified", height=500,
