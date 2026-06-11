@@ -27,6 +27,16 @@ class TestConstantsExist:
         assert C.MC_DEFAULT_RUNS >= 2000, "kill-%ile unstable below 2000 runs"
         assert 8 <= C.MC_DEFAULT_BLOCK_LEN <= 12, "block should be ~n^(1/3)≈10"
 
+    def test_portfolio_mc_uses_long_blocks(self):
+        """Portfolio Forward-Risk MC must use LONG blocks (≈60d), separate from
+        the per-strategy block-10. Short blocks dice multi-month drawdown
+        sequences and understate the portfolio ruin/MaxDD tail (history contains
+        a fold-level −38.7% window that block-10 resampling barely reproduces).
+        """
+        assert C.MC_PORTFOLIO_BLOCK_LEN >= 40, "portfolio MC needs regime-length blocks"
+        assert C.MC_PORTFOLIO_BLOCK_LEN != C.MC_DEFAULT_BLOCK_LEN, \
+            "portfolio block is intentionally distinct from per-strategy block"
+
     def test_all_constants_present(self):
         for name in [
             'DEFAULT_COST_BPS_RT', 'DEFAULT_SLIPPAGE_BPS', 'DEFAULT_FUNDING_BPS_PER_DAY',
@@ -111,6 +121,18 @@ class TestSidebarReadsConstants:
         fp = body[fp_start:body.index('if st.session_state', fp_start)]
         assert 'mc_block_len' in fp, "vt data_fp must include mc_block_len"
         assert 'mc_seed' in fp, "vt data_fp must include mc_seed"
+
+    def test_portfolio_mc_wired_to_portfolio_block(self):
+        """auto_compute_mc must pass MC_PORTFOLIO_BLOCK_LEN (not the sidebar
+        mc_block_len) to the portfolio monte_carlo call AND include it in its
+        cache fingerprint — otherwise the long-block intent silently reverts."""
+        src = self._app_src()
+        start = src.index('def auto_compute_mc(')
+        body = src[start:src.index('\nauto_compute_mc()', start)]
+        assert 'MC_PORTFOLIO_BLOCK_LEN' in body, \
+            "auto_compute_mc must use calculations.MC_PORTFOLIO_BLOCK_LEN"
+        assert 'block_len=mc_block_len' not in body, \
+            "portfolio MC must NOT use the sidebar (per-strategy) block length"
 
     def test_sidebar_uses_constants_not_literals(self):
         src = self._app_src()

@@ -116,6 +116,14 @@ CALENDAR_DAYS_PER_YEAR = 365.25
 MC_DEFAULT_RUNS = 2000
 MC_DEFAULT_BLOCK_LEN = 10
 MC_DEFAULT_SEED = 42
+# Portfolio-level Forward-Risk MC uses LONGER blocks than the per-strategy MCs.
+# Block=10 (Politis-White optimum for near-IID daily P&L) is right for kill
+# %iles, but at the PORTFOLIO level it dices multi-month drawdown sequences
+# into 10-day chunks interleaved with bull chunks — simulated paths regress to
+# the sample mean and the ruin/MaxDD tail is understated (history contains a
+# fold-level −38.7% window the block-10 MC barely reproduces). Block=60
+# preserves regime persistence at the cost of fewer distinct blocks.
+MC_PORTFOLIO_BLOCK_LEN = 60
 
 # ── Risk-free rate (annualized) ─────────────────────────────────────────────
 DEFAULT_RFR = 0.04

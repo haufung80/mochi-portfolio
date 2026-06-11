@@ -1064,7 +1064,10 @@ with st.sidebar:
             "Number of runs", value=int(calculations.MC_DEFAULT_RUNS), min_value=100, step=500)
         mc_block_len = st.number_input(
             "Block length (days)", value=int(calculations.MC_DEFAULT_BLOCK_LEN), min_value=1,
-            help="Block bootstrap preserves serial dependence",
+            help="Block bootstrap preserves serial dependence. Applies to the "
+                 "PER-STRATEGY MCs (kill envelopes, VT sizing). The portfolio "
+                 f"Forward-Risk MC uses a fixed {calculations.MC_PORTFOLIO_BLOCK_LEN}-day "
+                 "block to preserve multi-month drawdown sequences.",
         )
         mc_seed = st.number_input(
             "RNG seed (0 = random)", value=int(calculations.MC_DEFAULT_SEED), min_value=0)
@@ -1332,13 +1335,18 @@ def auto_compute_mc():
     ruin_eq = float(total_cap * VT_DEFAULT_RUIN_FRAC)
     # Fingerprint: sum + std of daily P&L identifies the distribution shape
     # (not just total). std catches vol-target changes that re-scale positions.
+    # Portfolio MC uses MC_PORTFOLIO_BLOCK_LEN (60), NOT the sidebar block:
+    # long blocks preserve multi-month drawdown sequences so the ruin/MaxDD tail
+    # isn't diluted by reshuffling bear runs into bull chunks. The sidebar block
+    # (10) still drives the PER-STRATEGY MCs (kill envelopes, VT sizing).
     mc_fp = (
         float(np.nansum(daily_pnl)),
         float(np.nanstd(daily_pnl)),
         float(vt_view['stats']['Final Equity']),
         len(daily_pnl),
         start_eq, ruin_eq,
-        int(mc_trades_per_year), int(mc_n_runs), int(mc_block_len), int(mc_seed),
+        int(mc_trades_per_year), int(mc_n_runs),
+        int(calculations.MC_PORTFOLIO_BLOCK_LEN), int(mc_seed),
     )
     if st.session_state.get('mc_fp') == mc_fp and 'mc_results' in st.session_state:
         return  # nothing changed
@@ -1350,7 +1358,7 @@ def auto_compute_mc():
             trades_per_year=mc_trades_per_year,
             n_runs=mc_n_runs,
             seed=mc_seed if mc_seed > 0 else None,
-            block_len=mc_block_len,
+            block_len=calculations.MC_PORTFOLIO_BLOCK_LEN,
         )
         st.session_state['mc_start_used'] = start_eq
         st.session_state['mc_ruin_used'] = ruin_eq
@@ -2979,7 +2987,9 @@ if active_tab == TAB_MC:
                 f"**{len(daily_pnl_for_mc)} vol-targeted daily P&L observations** (net of costs) · "
                 f"Start ${mc_start_equity_eff:,.0f} · Ruin ${mc_ruin_equity_eff:,.0f} "
                 f"(loss of {(1 - VT_DEFAULT_RUIN_FRAC) * 100:.0f}%) · "
-                f"{mc_n_runs:,} runs · {mc_trades_per_year}/yr trade frequency · block={mc_block_len}"
+                f"{mc_n_runs:,} runs · {mc_trades_per_year}/yr trade frequency · "
+                f"block={calculations.MC_PORTFOLIO_BLOCK_LEN}d (long blocks preserve "
+                f"multi-month drawdown sequences; per-strategy MCs use the sidebar block)"
             )
         with btn_col:
             if st.button("🔄 Recompute MC", use_container_width=True,
