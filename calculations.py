@@ -55,11 +55,14 @@ COMMON_EXCHANGE = 'BINANCE|BYBIT'
 COMMON_TICKERS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT']
 
 # TradingView changed export column names in 2026 (e.g. "Date/Time" → "Date and time",
-# "Position size (value)" → "Size (value)"). Normalize incoming CSVs so the rest of
-# the pipeline can use a single canonical schema.
+# "Position size (value)" → "Size (value)", and mid-2026 "Net P&L USDT" → "Net PnL USDT"
+# — ampersand dropped, "P&L" respelled "PnL"). Normalize incoming CSVs so the rest of
+# the pipeline can use a single canonical schema. (The UTF-8 BOM some exports carry is
+# already stripped by pandas.read_csv, so it needs no handling here.)
 TV_COLUMN_ALIASES = {
     'Date and time': 'Date/Time',
     'Size (value)': 'Position size (value)',
+    'Net PnL USDT': 'Net P&L USDT',
 }
 
 # ============================================================================

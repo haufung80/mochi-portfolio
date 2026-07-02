@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -58,6 +59,30 @@ def _no_btc(*_a, **_k):
     return pd.DataFrame()
 
 
+# Strategy filenames carry a trailing TradingView export date (…_YYYY-MM-DD) that
+# changes on every re-export. Key the snapshot by the date-STRIPPED identity so the
+# golden master survives a routine data refresh AND still diffs each strategy's
+# metrics across it. With date-suffixed keys, a refresh made every strategy look
+# brand-new (empty old∩new intersection) and the per-strategy comparison was
+# silently skipped — the exact hole a refresh should NOT open in the regression armor.
+_DATE_SUFFIX_RE = re.compile(r"_\d{4}-\d{2}-\d{2}$")
+
+
+def _key_by_strategy(pairs) -> dict:
+    """Build a {date-stripped strategy name → value} dict, failing loudly on a
+    collision (e.g. an old and new export of the same strategy present at once,
+    which would otherwise silently collapse to one key and hide a strategy)."""
+    out: dict = {}
+    for name, value in pairs:
+        key = _DATE_SUFFIX_RE.sub("", str(name))
+        if key in out:
+            raise RuntimeError(
+                f"duplicate strategy key after date-strip: {key!r} — two exports of "
+                f"the same strategy in the data folder? Remove the stale one.")
+        out[key] = value
+    return out
+
+
 def build_snapshot() -> dict:
     """Run the real pipeline and distill it to a stable, comparable dict."""
     orig = C.fetch_btc_daily
@@ -84,11 +109,13 @@ def build_snapshot() -> dict:
             f"process_portfolio loaded no strategies from {DATA_DIR} "
             f"(failed_files={port_stats.get('failed_files')}) — refusing to snapshot.")
 
-    metrics = {
-        str(strat): {k: float(metrics_df.loc[strat, k]) for k in _METRIC_KEYS}
+    metrics = _key_by_strategy(
+        (strat, {k: float(metrics_df.loc[strat, k]) for k in _METRIC_KEYS})
         for strat in metrics_df.index
-    }
-    vt_positions = {str(k): float(v) for k, v in vt["position_sizes"].items()}
+    )
+    vt_positions = _key_by_strategy(
+        (k, float(v)) for k, v in vt["position_sizes"].items()
+    )
     return {
         "n_strategies": int(len(metrics_df)),
         "metrics": metrics,
