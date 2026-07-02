@@ -281,18 +281,62 @@ ROLLING_WINDOW_DAYS = 60 # Rolling Sharpe / Calmar window
 
 ### Honest limitations
 1. **MC envelope is static** — uses backtest distribution only, never updates with accumulated live data. A Bayesian posterior update would be more rigorous but requires a heavier statistical framework.
-2. **No multiple-hypothesis correction** — at α=5% and ~17 strategies × monthly reviews, expect ~1 false kill every ~4 weeks by chance. Bonferroni or FDR correction would harden permanent-kill decisions.
+2. **No multiple-hypothesis correction on kills** — at α=5% across ~16 strategies, any single review has a meaningful chance of containing one noise-driven kill. In practice this is softened two ways: reviews run **~quarterly** (the realized cadence — two post-launch cull dates in 6+ months — not monthly), and a noise kill surfaces as a *recoverable* UNLUCKY **suspend** unless the KS test independently fires (permanent archive requires both). A Benjamini-Hochberg threshold would still harden permanent-archive decisions, but the architecture already absorbs most of the cost — see the roadmap for why this is downgraded.
 3. **KS test has weak power at n=20-30** — non-firing KS isn't strong evidence of stability, just "not enough data to conclude". Diagnosis is honest about this in the tooltip.
-4. **Regime from BTC only** — strategies on ETH/SOL/BNB use BTC regime for kill decisions. Per-ticker regime is computed internally but not consumed by the per-strategy kill rule.
+4. **Kill rule is regime-agnostic (by design)** — the kill verdict is a pure MC-envelope tail test on each strategy's *own* P&L; it consumes **no** regime label, BTC or per-ticker. Regime classification feeds the attribution, family, and pair-divergence views for *human* interpretation only. This is deliberate — regime-conditioning the envelope would split the already-thin ≥20-trade live sample across regimes and undermine the `MIN_LIVE_TRADES` guard. The practical consequence: a LONG-only alt strategy that drew down during a BTC-only bear must be cross-checked against its *own* ticker's regime by eye (the per-ticker regime is computed and shown for exactly this) before you archive it.
 5. **Cost model is generic** — real Bybit fee tier varies; users can override sidebar values.
 
-### Possible future additions
-- Online MC update (re-bootstrap monthly with live data weighted in)
-- FDR-controlled kill threshold (Benjamini-Hochberg)
-- Per-ticker regime in kill rule
-- 2-tier kill: running suspend vs permanent archive (after N consecutive kill verdicts)
-- Time-varying regime model (HMM or regime-switching VAR)
-- Bayesian posterior on strategy Sharpe given backtest prior + live observations
+### Where the next phase should go
+
+The engine is **feature-complete and test-hardened** — the six tabs cover the full
+deploy → monitor → size workflow, and ~130 tests guard `calculations.py`. So the
+honest question for the next phase is *not* "what statistics can we add" but **"have
+the statistics we already shipped actually worked?"** Six-plus months of live
+incubation (since 2025-12-03) and ~20 archived strategies across three cull
+generations now make that empirically answerable. The list below is reprioritized
+accordingly — and most of the old "future additions" are deliberately demoted.
+
+**P1 — close the loop (highest value, only now possible):**
+- **Verdict-history persistence.** Every verdict is recomputed *stateless* each run;
+  nothing records when a strategy first crossed WARN → KILL. Persist a per-strategy
+  verdict log. This is the prerequisite for everything below.
+- **Kill-rule back-test.** With ~20 realized kills, test the engine against its own
+  history: did killed strategies stay dead? did any UNLUCKY-suspended ones recover?
+  This validates (or recalibrates) the 5 % / 15 % / 20-trade thresholds on *real
+  outcomes* — worth more than any new statistic bolted onto an unvalidated rule.
+
+**P1 — operational:**
+- **Data-staleness guard.** Verdicts are only valid on fresh exports, but the loaded
+  CSVs can silently age and the tool has no concept of "last refreshed." Surface a
+  staleness banner when the newest export is older than the review cadence. A stale
+  kill verdict is worse than no verdict.
+
+**P2 — only if the back-test shows real noise:**
+- **Temporal kill hysteresis** *(supersedes the old "2-tier kill" item — suspend-vs-
+  archive already exists via the edge diagnosis).* The genuine gap is debouncing:
+  require **N consecutive** KILL verdicts before a *permanent* archive. For this
+  architecture that is a better false-positive defense than a multiple-testing
+  correction, and it falls straight out of verdict-history persistence.
+
+**Downgraded (marginal given the current design):**
+- **FDR / Bonferroni on kills.** The realized review cadence is ~quarterly, not
+  monthly, and a false kill already lands as a *recoverable* UNLUCKY suspend unless
+  KS independently fires. The architecture absorbs most of the cost a correction
+  would buy back. Revisit only if the back-test shows *good* strategies being
+  *permanently* archived by noise.
+
+**Reconsidered / likely drop:**
+- **Online MC envelope update.** As originally framed (re-bootstrap with live data
+  weighted in) it **contaminates the out-of-sample test** — the core invariant is
+  "never fit on live data." The only OOS-preserving version is a Bayesian posterior
+  on Sharpe (backtest prior + live likelihood) shown as a *separate* evidence-
+  accumulation panel that never feeds the kill envelope.
+- **Per-ticker regime *in the kill rule*.** See limitation #4: the kill rule is
+  regime-agnostic by design, and conditioning it would fight the ≥20-trade floor.
+  Per-ticker regime already lives where it belongs — attribution and pair views.
+
+**Still genuinely open (unchanged scope):**
+- Time-varying regime model (HMM or regime-switching VAR) for the attribution tab.
 
 ### Out of scope
 This is not an execution engine. It analyzes TradingView CSV exports and outputs sizing recommendations; trade execution remains manual (TradingView alerts → Bybit) or via a separate broker integration.
